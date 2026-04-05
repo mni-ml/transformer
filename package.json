@@ -7,6 +7,7 @@
     "generate": "node generate.js"
   },
   "dependencies": {
-    "@mni-ml/framework": "^0.0.5"
+    "@mni-ml/framework": "file:framework/packages/framework",
+    "koffi": "^2.9.0"
   }
 }

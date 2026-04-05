@@ -19,11 +19,12 @@ const CONFIG = {
   nHead: 4,
   nLayer: 4,
   blockSize: 64,
-  batchSize: 16,
+  batchSize: 4,
   maxIters: 5000,
-  evalInterval: 100,
-  evalIters: 5,
-  generateEvery: 500,
+  evalInterval: 250,
+  evalIters: 3,
+  logInterval: 25,
+  generateEvery: 1250,
   generateLen: 200,
 
   lr: 6e-4,
@@ -36,7 +37,7 @@ const CONFIG = {
   minLr: 6e-5,
   maxGradNorm: 1.0,
 
-  checkpointEvery: 500,
+  checkpointEvery: 1000,
   modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
 };
 
@@ -444,6 +445,8 @@ async function estimateLoss(model, tokenizer, trainData, valData, config) {
       const targetOneHot = oneHot(targets, tokenizer.vocabSize);
       const loss = crossEntropyLoss(logits, targetOneHot);
       total += loss.item();
+      loss.history = null;
+      logits.history = null;
     }
     losses[name] = total / config.evalIters;
   }
@@ -466,6 +469,9 @@ async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) 
     for (let v = 0; v < vocabSize; v++) {
       lastLogits.push(logits.get([0, seqLen - 1, v]) / temperature);
     }
+
+    // Release autograd graph — we only need the extracted values
+    logits.history = null;
 
     const maxLogit = Math.max(...lastLogits);
     const exps = lastLogits.map(l => Math.exp(l - maxLogit));
@@ -548,8 +554,10 @@ async function main() {
 
   const startTime = Date.now();
   let bestValLoss = Infinity;
+  let stepStart = Date.now();
 
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
+    stepStart = Date.now();
     optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
 
     const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
@@ -563,12 +571,16 @@ async function main() {
     const gradNorm = clipGradNorm(params, CONFIG.maxGradNorm);
     optimizer.step();
 
+    const stepMs = Date.now() - stepStart;
+    const stepsCompleted = iter - startStep + 1;
+
     if (iter % CONFIG.evalInterval === 0) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
       const losses = await estimateLoss(model, tokenizer, trainData, valData, CONFIG);
       const marker = losses.val < bestValLoss ? ' *' : '';
       if (losses.val < bestValLoss) bestValLoss = losses.val;
-      const etaSeconds = (CONFIG.maxIters - iter) * (Date.now() - startTime) / Math.max(1, iter) / 1000;
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+      const avgStepMs = (Date.now() - startTime) / stepsCompleted;
+      const etaSeconds = (CONFIG.maxIters - iter - 1) * avgStepMs / 1000;
       const eta = etaSeconds > 3600
         ? `${(etaSeconds / 3600).toFixed(1)}h`
         : `${(etaSeconds / 60).toFixed(0)}m`;
@@ -579,6 +591,15 @@ async function main() {
         ` lr ${optimizer.lr.toExponential(1)} │` +
         ` gnorm ${gradNorm.toFixed(1)} │` +
         ` ${elapsed}s (eta ${eta})`
+      );
+    } else if (iter % CONFIG.logInterval === 0) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+      const trainLoss = loss.item();
+      console.log(
+        `  step ${String(iter).padStart(5)} │` +
+        ` loss ${trainLoss.toFixed(4)} │` +
+        ` ${(stepMs / 1000).toFixed(1)}s/step │` +
+        ` ${elapsed}s`
       );
     }
 

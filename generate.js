@@ -167,6 +167,8 @@ async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) 
     for (let v = 0; v < tokenizer.vocabSize; v++)
       lastLogits.push(logits.get([0, seqLen - 1, v]) / temperature);
 
+    logits.history = null;
+
     const maxLogit = Math.max(...lastLogits);
     const exps = lastLogits.map(l => Math.exp(l - maxLogit));
     const sumExps = exps.reduce((a, b) => a + b);
