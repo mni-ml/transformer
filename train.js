@@ -2,7 +2,7 @@ import {
   Tensor, TensorData,
   Module, Parameter,
   Linear, Embedding,
-  softmax, crossEntropyLoss, destroyPool,
+  softmax, crossEntropyLoss, destroyPool, destroyDevice, gelu, dropout,
 } from '@mni-ml/framework';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -15,27 +15,28 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  nEmbd: 64,
+  nEmbd: 128,
   nHead: 4,
-  nLayer: 3,
-  blockSize: 32,
-  batchSize: 4,
-  maxIters: 3000,
+  nLayer: 4,
+  blockSize: 64,
+  batchSize: 16,
+  maxIters: 5000,
   evalInterval: 100,
   evalIters: 5,
   generateEvery: 500,
-  generateLen: 150,
+  generateLen: 200,
 
   lr: 6e-4,
   beta1: 0.9,
   beta2: 0.95,
   weightDecay: 0.01,
+  dropoutRate: 0.1,
 
-  warmupSteps: 100,
+  warmupSteps: 200,
   minLr: 6e-5,
   maxGradNorm: 1.0,
 
-  checkpointEvery: 250,
+  checkpointEvery: 500,
   modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
 };
 
@@ -50,10 +51,6 @@ const NO_RESUME = process.env.NO_RESUME === '1';
 
 // ════════════════════════════════════════════════════════════════
 // Adam Optimizer
-//
-// Follows the same raw-storage pattern as the framework's SGD:
-// read contiguous gradient and value arrays, compute updates
-// element-by-element, write a new Tensor back to the Parameter.
 // ════════════════════════════════════════════════════════════════
 
 class Adam {
@@ -183,9 +180,6 @@ function loadTrainingText() {
 
 // ════════════════════════════════════════════════════════════════
 // Model Serialization
-//
-// Saves all parameter weights + tokenizer + config to a JSON file
-// so the trained model can be loaded later for generation.
 // ════════════════════════════════════════════════════════════════
 
 function saveModel(model, tokenizer, path, { step = -1 } = {}) {
@@ -256,9 +250,6 @@ class CharTokenizer {
 
 // ════════════════════════════════════════════════════════════════
 // Layer Normalization
-//
-// Composed from primitives: y = (x - mean) / sqrt(var + eps) * γ + β
-// Uses log-exp trick for 1/sqrt: exp(-0.5 * ln(var + eps))
 // ════════════════════════════════════════════════════════════════
 
 class LayerNorm extends Module {
@@ -281,63 +272,73 @@ class LayerNorm extends Module {
 // Causal Self-Attention (Multi-Head)
 // ════════════════════════════════════════════════════════════════
 
-function createCausalMask(size) {
+const _causalMaskCache = new Map();
+function getCausalMask(size) {
+  if (_causalMaskCache.has(size)) return _causalMaskCache.get(size);
   const storage = new Float64Array(size * size);
   for (let i = 0; i < size; i++) {
     for (let j = 0; j < size; j++) {
       storage[i * size + j] = j <= i ? 0.0 : -1e9;
     }
   }
-  return new Tensor(new TensorData(storage, [1, 1, size, size]));
+  const mask = new Tensor(new TensorData(storage, [1, 1, size, size]));
+  _causalMaskCache.set(size, mask);
+  return mask;
 }
 
 class CausalSelfAttention extends Module {
-  constructor(nEmbd, nHead) {
+  constructor(nEmbd, nHead, dropoutRate) {
     super();
     this.nHead = nHead;
     this.headDim = nEmbd / nHead;
     this.scale = 1.0 / Math.sqrt(this.headDim);
+    this.dropoutRate = dropoutRate;
     this.queryProj = new Linear(nEmbd, nEmbd);
     this.keyProj = new Linear(nEmbd, nEmbd);
     this.valueProj = new Linear(nEmbd, nEmbd);
     this.outProj = new Linear(nEmbd, nEmbd);
   }
 
-  forward(x) {
+  async forward(x) {
     const [B, S, E] = x.shape;
     const { nHead, headDim, scale } = this;
 
-    let q = this.queryProj.forward(x);
-    let k = this.keyProj.forward(x);
-    let v = this.valueProj.forward(x);
+    let q = await this.queryProj.forward(x);
+    let k = await this.keyProj.forward(x);
+    let v = await this.valueProj.forward(x);
 
     q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
     const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
 
-    let att = q.matmul(kT).mul(scale);
-    att = att.add(createCausalMask(S));
+    let att = (await q.matmul(kT)).mul(scale);
+    att = att.add(getCausalMask(S));
     att = softmax(att, 3);
+    att = dropout(att, this.dropoutRate, !this.training);
 
-    let out = att.matmul(v);
+    let out = await att.matmul(v);
     out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
 
-    return this.outProj.forward(out);
+    return await this.outProj.forward(out);
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-// Feed-Forward Network (4x hidden expansion with ReLU)
+// Feed-Forward Network (4x hidden expansion with GELU)
 // ════════════════════════════════════════════════════════════════
 
 class FeedForward extends Module {
-  constructor(nEmbd) {
+  constructor(nEmbd, dropoutRate) {
     super();
+    this.dropoutRate = dropoutRate;
     this.fc1 = new Linear(nEmbd, 4 * nEmbd);
     this.fc2 = new Linear(4 * nEmbd, nEmbd);
   }
-  forward(x) {
-    return this.fc2.forward(this.fc1.forward(x).relu());
+  async forward(x) {
+    let h = await this.fc1.forward(x);
+    h = gelu(h);
+    h = await this.fc2.forward(h);
+    return dropout(h, this.dropoutRate, !this.training);
   }
 }
 
@@ -346,16 +347,16 @@ class FeedForward extends Module {
 // ════════════════════════════════════════════════════════════════
 
 class TransformerBlock extends Module {
-  constructor(nEmbd, nHead) {
+  constructor(nEmbd, nHead, dropoutRate) {
     super();
     this.ln1 = new LayerNorm(nEmbd);
-    this.attn = new CausalSelfAttention(nEmbd, nHead);
+    this.attn = new CausalSelfAttention(nEmbd, nHead, dropoutRate);
     this.ln2 = new LayerNorm(nEmbd);
-    this.ffn = new FeedForward(nEmbd);
+    this.ffn = new FeedForward(nEmbd, dropoutRate);
   }
-  forward(x) {
-    x = x.add(this.attn.forward(this.ln1.forward(x)));
-    x = x.add(this.ffn.forward(this.ln2.forward(x)));
+  async forward(x) {
+    x = x.add(await this.attn.forward(this.ln1.forward(x)));
+    x = x.add(await this.ffn.forward(this.ln2.forward(x)));
     return x;
   }
 }
@@ -367,7 +368,7 @@ class TransformerBlock extends Module {
 class MiniGPT extends Module {
   constructor(vocabSize, config) {
     super();
-    const { nEmbd, nHead, nLayer, blockSize } = config;
+    const { nEmbd, nHead, nLayer, blockSize, dropoutRate = 0 } = config;
     this.config = config;
     this.vocabSize = vocabSize;
 
@@ -375,14 +376,14 @@ class MiniGPT extends Module {
     this.posEmb = new Embedding(blockSize, nEmbd);
 
     for (let i = 0; i < nLayer; i++) {
-      this[`block${i}`] = new TransformerBlock(nEmbd, nHead);
+      this[`block${i}`] = new TransformerBlock(nEmbd, nHead, dropoutRate);
     }
 
     this.lnFinal = new LayerNorm(nEmbd);
-    this.head = new Linear(nEmbd, vocabSize);
+    this.headBias = new Parameter(Tensor.zeros([vocabSize]));
   }
 
-  forward(indices) {
+  async forward(indices) {
     const batch = indices.length;
     const seqLen = indices[0].length;
 
@@ -395,11 +396,13 @@ class MiniGPT extends Module {
     x = x.add(this.posEmb.forward(posIndices));
 
     for (let i = 0; i < this.config.nLayer; i++) {
-      x = this[`block${i}`].forward(x);
+      x = await this[`block${i}`].forward(x);
     }
 
     x = this.lnFinal.forward(x);
-    return this.head.forward(x);
+    // Weight tying: reuse token embedding transposed as output projection
+    const wT = this.tokenEmb.weight.value.permute(1, 0);
+    return (await x.matmul(wT)).add(this.headBias.value);
   }
 }
 
@@ -430,29 +433,32 @@ function getBatch(data, blockSize, batchSize) {
   return { inputs, targets };
 }
 
-function estimateLoss(model, tokenizer, trainData, valData, config) {
+async function estimateLoss(model, tokenizer, trainData, valData, config) {
+  model.eval();
   const losses = { train: 0, val: 0 };
   for (const [name, data] of [['train', trainData], ['val', valData]]) {
     let total = 0;
     for (let i = 0; i < config.evalIters; i++) {
       const { inputs, targets } = getBatch(data, config.blockSize, config.batchSize);
-      const logits = model.forward(inputs);
+      const logits = await model.forward(inputs);
       const targetOneHot = oneHot(targets, tokenizer.vocabSize);
       const loss = crossEntropyLoss(logits, targetOneHot);
       total += loss.item();
     }
     losses[name] = total / config.evalIters;
   }
+  model.train();
   return losses;
 }
 
-function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
+async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
+  model.eval();
   let context = tokenizer.encode(prompt);
   const blockSize = model.config.blockSize;
 
   for (let i = 0; i < maxTokens; i++) {
     const ctxWindow = context.slice(-blockSize);
-    const logits = model.forward([ctxWindow]);
+    const logits = await model.forward([ctxWindow]);
 
     const seqLen = ctxWindow.length;
     const vocabSize = tokenizer.vocabSize;
@@ -477,6 +483,7 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
     context.push(nextToken);
   }
 
+  model.train();
   return tokenizer.decode(context);
 }
 
@@ -484,7 +491,7 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
 // Training
 // ════════════════════════════════════════════════════════════════
 
-function main() {
+async function main() {
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
   console.log('  MiniGPT — Training a Tiny Transformer LLM');
@@ -516,6 +523,7 @@ function main() {
   console.log(`  Validation:     ${valData.length.toLocaleString()} tokens`);
   console.log(`  Architecture:   ${CONFIG.nLayer} blocks, ${CONFIG.nHead} heads, ${CONFIG.nEmbd}-dim`);
   console.log(`  Context window: ${CONFIG.blockSize} tokens`);
+  console.log(`  Dropout:        ${CONFIG.dropoutRate}`);
 
   if (!model) model = new MiniGPT(tokenizer.vocabSize, CONFIG);
   const params = model.parameters();
@@ -547,17 +555,17 @@ function main() {
     const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
 
     optimizer.zeroGrad();
-    const logits = model.forward(inputs);
+    const logits = await model.forward(inputs);
     const targetOneHot = oneHot(targets, tokenizer.vocabSize);
     const loss = crossEntropyLoss(logits, targetOneHot);
-    loss.backward();
+    await loss.backward();
 
     const gradNorm = clipGradNorm(params, CONFIG.maxGradNorm);
     optimizer.step();
 
     if (iter % CONFIG.evalInterval === 0) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-      const losses = estimateLoss(model, tokenizer, trainData, valData, CONFIG);
+      const losses = await estimateLoss(model, tokenizer, trainData, valData, CONFIG);
       const marker = losses.val < bestValLoss ? ' *' : '';
       if (losses.val < bestValLoss) bestValLoss = losses.val;
       const etaSeconds = (CONFIG.maxIters - iter) * (Date.now() - startTime) / Math.max(1, iter) / 1000;
@@ -575,7 +583,7 @@ function main() {
     }
 
     if (iter > 0 && iter % CONFIG.generateEvery === 0) {
-      const sample = generate(model, tokenizer, '\n', CONFIG.generateLen);
+      const sample = await generate(model, tokenizer, '\n', CONFIG.generateLen);
       console.log('');
       console.log('  ── sample ──────────────────────────────────────────');
       for (const line of sample.split('\n').slice(0, 6)) {
@@ -595,7 +603,7 @@ function main() {
   console.log('  Final Generation (temperature=0.8)');
   console.log('─────────────────────────────────────────────────────────');
   console.log('');
-  const finalText = generate(model, tokenizer, '\n', CONFIG.generateLen * 2);
+  const finalText = await generate(model, tokenizer, '\n', CONFIG.generateLen * 2);
   for (const line of finalText.split('\n').slice(0, 12)) {
     console.log(`  ${line}`);
   }
@@ -609,6 +617,7 @@ function main() {
   console.log('═══════════════════════════════════════════════════════');
 
   destroyPool();
+  destroyDevice();
 }
 
 main();

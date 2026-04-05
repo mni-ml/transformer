@@ -10,7 +10,7 @@ import {
   Tensor, TensorData,
   Module, Parameter,
   Linear, Embedding,
-  softmax, destroyPool,
+  softmax, destroyPool, destroyDevice, gelu, dropout,
 } from '@mni-ml/framework';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -36,12 +36,16 @@ class LayerNorm extends Module {
   }
 }
 
-function createCausalMask(size) {
+const _causalMaskCache = new Map();
+function getCausalMask(size) {
+  if (_causalMaskCache.has(size)) return _causalMaskCache.get(size);
   const storage = new Float64Array(size * size);
   for (let i = 0; i < size; i++)
     for (let j = 0; j < size; j++)
       storage[i * size + j] = j <= i ? 0.0 : -1e9;
-  return new Tensor(new TensorData(storage, [1, 1, size, size]));
+  const mask = new Tensor(new TensorData(storage, [1, 1, size, size]));
+  _causalMaskCache.set(size, mask);
+  return mask;
 }
 
 class CausalSelfAttention extends Module {
@@ -50,36 +54,42 @@ class CausalSelfAttention extends Module {
     this.nHead = nHead;
     this.headDim = nEmbd / nHead;
     this.scale = 1.0 / Math.sqrt(this.headDim);
+    this.dropoutRate = 0;
     this.queryProj = new Linear(nEmbd, nEmbd);
     this.keyProj = new Linear(nEmbd, nEmbd);
     this.valueProj = new Linear(nEmbd, nEmbd);
     this.outProj = new Linear(nEmbd, nEmbd);
   }
-  forward(x) {
+  async forward(x) {
     const [B, S, E] = x.shape;
     const { nHead, headDim, scale } = this;
-    let q = this.queryProj.forward(x);
-    let k = this.keyProj.forward(x);
-    let v = this.valueProj.forward(x);
+    let q = await this.queryProj.forward(x);
+    let k = await this.keyProj.forward(x);
+    let v = await this.valueProj.forward(x);
     q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
     const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
-    let att = q.matmul(kT).mul(scale);
-    att = att.add(createCausalMask(S));
+    let att = (await q.matmul(kT)).mul(scale);
+    att = att.add(getCausalMask(S));
     att = softmax(att, 3);
-    let out = att.matmul(v);
+    let out = await att.matmul(v);
     out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
-    return this.outProj.forward(out);
+    return await this.outProj.forward(out);
   }
 }
 
 class FeedForward extends Module {
   constructor(nEmbd) {
     super();
+    this.dropoutRate = 0;
     this.fc1 = new Linear(nEmbd, 4 * nEmbd);
     this.fc2 = new Linear(4 * nEmbd, nEmbd);
   }
-  forward(x) { return this.fc2.forward(this.fc1.forward(x).relu()); }
+  async forward(x) {
+    let h = await this.fc1.forward(x);
+    h = gelu(h);
+    return await this.fc2.forward(h);
+  }
 }
 
 class TransformerBlock extends Module {
@@ -90,9 +100,9 @@ class TransformerBlock extends Module {
     this.ln2 = new LayerNorm(nEmbd);
     this.ffn = new FeedForward(nEmbd);
   }
-  forward(x) {
-    x = x.add(this.attn.forward(this.ln1.forward(x)));
-    x = x.add(this.ffn.forward(this.ln2.forward(x)));
+  async forward(x) {
+    x = x.add(await this.attn.forward(this.ln1.forward(x)));
+    x = x.add(await this.ffn.forward(this.ln2.forward(x)));
     return x;
   }
 }
@@ -108,9 +118,9 @@ class MiniGPT extends Module {
     for (let i = 0; i < nLayer; i++)
       this[`block${i}`] = new TransformerBlock(nEmbd, nHead);
     this.lnFinal = new LayerNorm(nEmbd);
-    this.head = new Linear(nEmbd, vocabSize);
+    this.headBias = new Parameter(Tensor.zeros([vocabSize]));
   }
-  forward(indices) {
+  async forward(indices) {
     const batch = indices.length;
     const seqLen = indices[0].length;
     let x = this.tokenEmb.forward(indices);
@@ -119,9 +129,10 @@ class MiniGPT extends Module {
       posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
     x = x.add(this.posEmb.forward(posIndices));
     for (let i = 0; i < this.config.nLayer; i++)
-      x = this[`block${i}`].forward(x);
+      x = await this[`block${i}`].forward(x);
     x = this.lnFinal.forward(x);
-    return this.head.forward(x);
+    const wT = this.tokenEmb.weight.value.permute(1, 0);
+    return (await x.matmul(wT)).add(this.headBias.value);
   }
 }
 
@@ -143,13 +154,14 @@ function loadModel(path) {
   return { model, tokenizer, config: checkpoint.config };
 }
 
-function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
+async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
+  model.eval();
   let context = tokenizer.encode(prompt);
   const blockSize = model.config.blockSize;
 
   for (let i = 0; i < maxTokens; i++) {
     const ctxWindow = context.slice(-blockSize);
-    const logits = model.forward([ctxWindow]);
+    const logits = await model.forward([ctxWindow]);
     const seqLen = ctxWindow.length;
     const lastLogits = [];
     for (let v = 0; v < tokenizer.vocabSize; v++)
@@ -191,7 +203,8 @@ const { model, tokenizer, config } = loadModel(modelPath);
 console.log(`Model: ${config.nLayer} layers, ${config.nHead} heads, ${config.nEmbd}-dim`);
 console.log(`Generating ${numTokens} tokens (temperature=${temperature})...\n`);
 
-const text = generate(model, tokenizer, prompt, numTokens, temperature);
+const text = await generate(model, tokenizer, prompt, numTokens, temperature);
 console.log(text);
 
 destroyPool();
+destroyDevice();

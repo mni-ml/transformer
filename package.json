@@ -7,6 +7,6 @@
     "generate": "node generate.js"
   },
   "dependencies": {
-    "@mni-ml/framework": "^0.0.3"
+    "@mni-ml/framework": "^0.0.5"
   }
 }
