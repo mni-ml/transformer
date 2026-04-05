@@ -4,7 +4,7 @@ import {
   Linear, Embedding,
   softmax, crossEntropyLoss, destroyPool,
 } from '@mni-ml/framework';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,17 +35,18 @@ const CONFIG = {
   minLr: 6e-5,
   maxGradNorm: 1.0,
 
-  checkpointEvery: 500,
+  checkpointEvery: 250,
   modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
 };
 
 for (const [key, envKey] of [
   ['maxIters', 'MAX_ITERS'], ['batchSize', 'BATCH_SIZE'],
   ['nEmbd', 'N_EMBD'], ['nHead', 'N_HEAD'], ['nLayer', 'N_LAYER'],
-  ['blockSize', 'BLOCK_SIZE'], ['lr', 'LR'],
+  ['blockSize', 'BLOCK_SIZE'], ['lr', 'LR'], ['checkpointEvery', 'CHECKPOINT_EVERY'],
 ]) {
   if (process.env[envKey]) CONFIG[key] = Number(process.env[envKey]);
 }
+const NO_RESUME = process.env.NO_RESUME === '1';
 
 // ════════════════════════════════════════════════════════════════
 // Adam Optimizer
@@ -187,7 +188,7 @@ function loadTrainingText() {
 // so the trained model can be loaded later for generation.
 // ════════════════════════════════════════════════════════════════
 
-function saveModel(model, tokenizer, path) {
+function saveModel(model, tokenizer, path, { step = -1 } = {}) {
   const namedParams = model.namedParameters();
   const params = {};
   for (const [name, param] of namedParams) {
@@ -201,6 +202,7 @@ function saveModel(model, tokenizer, path) {
     config: model.config,
     tokenizer: { stoi: tokenizer.stoi, itos: tokenizer.itos, vocabSize: tokenizer.vocabSize },
     parameters: params,
+    step,
   };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(checkpoint));
@@ -222,7 +224,19 @@ function loadModel(path) {
     }
   }
   console.log(`  Model loaded from ${path}`);
-  return { model, tokenizer, config: checkpoint.config };
+  return { model, tokenizer, config: checkpoint.config, step: checkpoint.step ?? -1 };
+}
+
+function findLatestCheckpoint(dir) {
+  if (!existsSync(dir)) return null;
+  const files = readdirSync(dir).filter(f => f.startsWith('checkpoint-') && f.endsWith('.json'));
+  if (files.length === 0) return null;
+  const byStep = files.map(f => {
+    const m = f.match(/checkpoint-(\d+)\.json/);
+    return m ? { file: f, step: parseInt(m[1], 10) } : null;
+  }).filter(Boolean);
+  byStep.sort((a, b) => b.step - a.step);
+  return { path: join(dir, byStep[0].file), step: byStep[0].step };
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -477,8 +491,20 @@ function main() {
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
 
+  let model, tokenizer, startStep = 0;
+
+  const latest = NO_RESUME ? null : findLatestCheckpoint(CONFIG.modelDir);
+  if (latest) {
+    console.log(`  Resuming from checkpoint at step ${latest.step}`);
+    const loaded = loadModel(latest.path);
+    model = loaded.model;
+    tokenizer = loaded.tokenizer;
+    startStep = latest.step;
+    console.log('');
+  }
+
   const text = loadTrainingText();
-  const tokenizer = new CharTokenizer(text);
+  if (!tokenizer) tokenizer = new CharTokenizer(text);
   const allData = tokenizer.encode(text);
 
   const splitIdx = Math.floor(allData.length * 0.9);
@@ -491,17 +517,17 @@ function main() {
   console.log(`  Architecture:   ${CONFIG.nLayer} blocks, ${CONFIG.nHead} heads, ${CONFIG.nEmbd}-dim`);
   console.log(`  Context window: ${CONFIG.blockSize} tokens`);
 
-  const model = new MiniGPT(tokenizer.vocabSize, CONFIG);
+  if (!model) model = new MiniGPT(tokenizer.vocabSize, CONFIG);
   const params = model.parameters();
   const totalParams = params.reduce((sum, p) => sum + p.value.size, 0);
   console.log(`  Parameters:     ${totalParams.toLocaleString()}`);
   console.log(`  Optimizer:      Adam (lr=${CONFIG.lr}, β1=${CONFIG.beta1}, β2=${CONFIG.beta2})`);
   console.log(`  Schedule:       ${CONFIG.warmupSteps} warmup → cosine decay to ${CONFIG.minLr}`);
   console.log(`  Grad clipping:  max norm ${CONFIG.maxGradNorm}`);
-  console.log(`  Training:       ${CONFIG.maxIters} steps, batch=${CONFIG.batchSize}`);
+  console.log(`  Training:       steps ${startStep}→${CONFIG.maxIters}, batch=${CONFIG.batchSize}`);
   console.log('');
   console.log('─────────────────────────────────────────────────────────');
-  console.log('  Training');
+  console.log(`  Training${startStep > 0 ? ` (resuming from step ${startStep})` : ''}`);
   console.log('─────────────────────────────────────────────────────────');
   console.log('');
 
@@ -515,7 +541,7 @@ function main() {
   const startTime = Date.now();
   let bestValLoss = Infinity;
 
-  for (let iter = 0; iter < CONFIG.maxIters; iter++) {
+  for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
     optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
 
     const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
@@ -560,7 +586,7 @@ function main() {
     }
 
     if (iter > 0 && iter % CONFIG.checkpointEvery === 0) {
-      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`));
+      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`), { step: iter });
     }
   }
 
@@ -573,7 +599,7 @@ function main() {
   for (const line of finalText.split('\n').slice(0, 12)) {
     console.log(`  ${line}`);
   }
-  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'));
+  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'), { step: CONFIG.maxIters });
 
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
