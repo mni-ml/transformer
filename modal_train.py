@@ -17,7 +17,7 @@ import modal
 
 app = modal.App("mini-gpt-training")
 
-vol = modal.Volume.from_name("mini-gpt-vol", create_if_missing=True)
+vol = modal.Volume.from_name("mini-gpt-gpu-vol", create_if_missing=True)
 
 # NVIDIA CUDA runtime image — includes libcudart.so + libcublas.so
 # We install Node.js 22 on top so our JS training code can call cuBLAS
@@ -49,10 +49,10 @@ image = (
 
 @app.function(
     image=image,
-    timeout=8 * 60 * 60,
+    timeout=24 * 60 * 60,
     cpu=4,
-    memory=4096,
-    gpu="T4",
+    memory=16384,
+    gpu="A100",
     volumes={"/app/out": vol},
 )
 def train(steps: int = 0, fresh: bool = False):
@@ -68,7 +68,7 @@ def train(steps: int = 0, fresh: bool = False):
         raise SystemExit(result.returncode)
 
 
-@app.function(image=image, gpu="T4", timeout=300)
+@app.function(image=image, gpu="A100", timeout=300)
 def probe_gpu():
     result = subprocess.run(
         ["node", "gpu_probe.js"], cwd="/app", env=dict(os.environ)
@@ -83,5 +83,5 @@ def main(steps: int = 0, fresh: bool = False, probe: bool = False):
         probe_gpu.remote()
         return
     train.remote(steps=steps, fresh=fresh)
-    print("\nModel saved to Modal volume 'mini-gpt-vol'.")
-    print("Download with:  modal volume get mini-gpt-vol model-final.json")
+    print("\nModel saved to Modal volume 'mini-gpt-gpu-vol'.")
+    print("Download with:  modal volume get mini-gpt-gpu-vol model-final.json")

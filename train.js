@@ -15,29 +15,30 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  nEmbd: 128,
-  nHead: 4,
+  nEmbd: 256,
+  nHead: 8,
   nLayer: 4,
-  blockSize: 64,
+  blockSize: 128,
   batchSize: 4,
+  gradAccumSteps: 1,
   maxIters: 5000,
-  evalInterval: 250,
-  evalIters: 3,
-  logInterval: 25,
-  generateEvery: 1250,
-  generateLen: 200,
+  evalInterval: 500,
+  evalIters: 10,
+  logInterval: 50,
+  generateEvery: 1000,
+  generateLen: 300,
 
-  lr: 6e-4,
+  lr: 1e-3,
   beta1: 0.9,
-  beta2: 0.95,
+  beta2: 0.99,
   weightDecay: 0.01,
   dropoutRate: 0.1,
 
   warmupSteps: 200,
-  minLr: 6e-5,
+  minLr: 1e-4,
   maxGradNorm: 1.0,
 
-  checkpointEvery: 1000,
+  checkpointEvery: 500,
   modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
 };
 
@@ -45,6 +46,7 @@ for (const [key, envKey] of [
   ['maxIters', 'MAX_ITERS'], ['batchSize', 'BATCH_SIZE'],
   ['nEmbd', 'N_EMBD'], ['nHead', 'N_HEAD'], ['nLayer', 'N_LAYER'],
   ['blockSize', 'BLOCK_SIZE'], ['lr', 'LR'], ['checkpointEvery', 'CHECKPOINT_EVERY'],
+  ['gradAccumSteps', 'GRAD_ACCUM_STEPS'],
 ]) {
   if (process.env[envKey]) CONFIG[key] = Number(process.env[envKey]);
 }
@@ -183,7 +185,7 @@ function loadTrainingText() {
 // Model Serialization
 // ════════════════════════════════════════════════════════════════
 
-function saveModel(model, tokenizer, path, { step = -1 } = {}) {
+function saveModel(model, tokenizer, path, { step = -1, optimizer = null, bestValLoss = Infinity } = {}) {
   const namedParams = model.namedParameters();
   const params = {};
   for (const [name, param] of namedParams) {
@@ -198,7 +200,15 @@ function saveModel(model, tokenizer, path, { step = -1 } = {}) {
     tokenizer: { stoi: tokenizer.stoi, itos: tokenizer.itos, vocabSize: tokenizer.vocabSize },
     parameters: params,
     step,
+    bestValLoss,
   };
+  if (optimizer) {
+    checkpoint.optimizer = {
+      t: optimizer.t,
+      m: optimizer.m.map(arr => Array.from(arr)),
+      v: optimizer.v.map(arr => Array.from(arr)),
+    };
+  }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(checkpoint));
   const sizeMB = (Buffer.byteLength(JSON.stringify(checkpoint)) / 1024 / 1024).toFixed(1);
@@ -219,7 +229,14 @@ function loadModel(path) {
     }
   }
   console.log(`  Model loaded from ${path}`);
-  return { model, tokenizer, config: checkpoint.config, step: checkpoint.step ?? -1 };
+  return {
+    model,
+    tokenizer,
+    config: checkpoint.config,
+    step: checkpoint.step ?? -1,
+    optimizerState: checkpoint.optimizer ?? null,
+    bestValLoss: checkpoint.bestValLoss ?? Infinity,
+  };
 }
 
 function findLatestCheckpoint(dir) {
@@ -505,6 +522,8 @@ async function main() {
   console.log('');
 
   let model, tokenizer, startStep = 0;
+  let savedOptimizerState = null;
+  let bestValLoss = Infinity;
 
   const latest = NO_RESUME ? null : findLatestCheckpoint(CONFIG.modelDir);
   if (latest) {
@@ -513,6 +532,9 @@ async function main() {
     model = loaded.model;
     tokenizer = loaded.tokenizer;
     startStep = latest.step;
+    savedOptimizerState = loaded.optimizerState;
+    bestValLoss = loaded.bestValLoss;
+    console.log(`  Best val loss so far: ${bestValLoss === Infinity ? 'N/A' : bestValLoss.toFixed(4)}`);
     console.log('');
   }
 
@@ -535,10 +557,11 @@ async function main() {
   const params = model.parameters();
   const totalParams = params.reduce((sum, p) => sum + p.value.size, 0);
   console.log(`  Parameters:     ${totalParams.toLocaleString()}`);
+  const effectiveBatch = CONFIG.batchSize * CONFIG.gradAccumSteps;
   console.log(`  Optimizer:      Adam (lr=${CONFIG.lr}, β1=${CONFIG.beta1}, β2=${CONFIG.beta2})`);
   console.log(`  Schedule:       ${CONFIG.warmupSteps} warmup → cosine decay to ${CONFIG.minLr}`);
   console.log(`  Grad clipping:  max norm ${CONFIG.maxGradNorm}`);
-  console.log(`  Training:       steps ${startStep}→${CONFIG.maxIters}, batch=${CONFIG.batchSize}`);
+  console.log(`  Training:       steps ${startStep}→${CONFIG.maxIters}, micro-batch=${CONFIG.batchSize}, accum=${CONFIG.gradAccumSteps} (effective ${effectiveBatch})`);
   console.log('');
   console.log('─────────────────────────────────────────────────────────');
   console.log(`  Training${startStep > 0 ? ` (resuming from step ${startStep})` : ''}`);
@@ -551,53 +574,76 @@ async function main() {
     beta2: CONFIG.beta2,
     weightDecay: CONFIG.weightDecay,
   });
+  if (savedOptimizerState) {
+    optimizer.t = savedOptimizerState.t;
+    for (let i = 0; i < savedOptimizerState.m.length && i < optimizer.m.length; i++) {
+      optimizer.m[i] = new Float64Array(savedOptimizerState.m[i]);
+      optimizer.v[i] = new Float64Array(savedOptimizerState.v[i]);
+    }
+    console.log(`  Optimizer state restored (t=${optimizer.t})`);
+  }
 
   const startTime = Date.now();
-  let bestValLoss = Infinity;
   let stepStart = Date.now();
 
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
     stepStart = Date.now();
     optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
 
-    const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
-
     optimizer.zeroGrad();
-    const logits = await model.forward(inputs);
-    const targetOneHot = oneHot(targets, tokenizer.vocabSize);
-    const loss = crossEntropyLoss(logits, targetOneHot);
-    await loss.backward();
+    let accumLoss = 0;
+
+    for (let microStep = 0; microStep < CONFIG.gradAccumSteps; microStep++) {
+      const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
+      const logits = await model.forward(inputs);
+      const targetOneHot = oneHot(targets, tokenizer.vocabSize);
+      const loss = crossEntropyLoss(logits, targetOneHot);
+      const scaledLoss = loss.mul(1 / CONFIG.gradAccumSteps);
+      await scaledLoss.backward();
+      accumLoss += loss.item();
+      loss.history = null;
+      logits.history = null;
+      scaledLoss.history = null;
+      if (iter === startStep && microStep === 0) {
+        console.log(`  [first micro-batch done: ${((Date.now() - stepStart) / 1000).toFixed(1)}s, loss=${(accumLoss).toFixed(4)}]`);
+      }
+    }
+    accumLoss /= CONFIG.gradAccumSteps;
 
     const gradNorm = clipGradNorm(params, CONFIG.maxGradNorm);
     optimizer.step();
 
     const stepMs = Date.now() - stepStart;
     const stepsCompleted = iter - startStep + 1;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
 
     if (iter % CONFIG.evalInterval === 0) {
+      console.log(
+        `  step ${String(iter).padStart(5)} │` +
+        ` loss ${accumLoss.toFixed(4)} │` +
+        ` ${(stepMs / 1000).toFixed(1)}s/step │` +
+        ` ${elapsed}s │ evaluating...`
+      );
       const losses = await estimateLoss(model, tokenizer, trainData, valData, CONFIG);
       const marker = losses.val < bestValLoss ? ' *' : '';
       if (losses.val < bestValLoss) bestValLoss = losses.val;
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
       const avgStepMs = (Date.now() - startTime) / stepsCompleted;
       const etaSeconds = (CONFIG.maxIters - iter - 1) * avgStepMs / 1000;
       const eta = etaSeconds > 3600
         ? `${(etaSeconds / 3600).toFixed(1)}h`
         : `${(etaSeconds / 60).toFixed(0)}m`;
       console.log(
-        `  step ${String(iter).padStart(5)} │` +
+        `         ${' '.repeat(5)} │` +
         ` train ${losses.train.toFixed(4)} │` +
         ` val ${losses.val.toFixed(4)}${marker} │` +
         ` lr ${optimizer.lr.toExponential(1)} │` +
         ` gnorm ${gradNorm.toFixed(1)} │` +
-        ` ${elapsed}s (eta ${eta})`
+        ` eta ${eta}`
       );
     } else if (iter % CONFIG.logInterval === 0) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-      const trainLoss = loss.item();
       console.log(
         `  step ${String(iter).padStart(5)} │` +
-        ` loss ${trainLoss.toFixed(4)} │` +
+        ` loss ${accumLoss.toFixed(4)} │` +
         ` ${(stepMs / 1000).toFixed(1)}s/step │` +
         ` ${elapsed}s`
       );
@@ -615,7 +661,7 @@ async function main() {
     }
 
     if (iter > 0 && iter % CONFIG.checkpointEvery === 0) {
-      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`), { step: iter });
+      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`), { step: iter, optimizer, bestValLoss });
     }
   }
 
@@ -628,7 +674,7 @@ async function main() {
   for (const line of finalText.split('\n').slice(0, 12)) {
     console.log(`  ${line}`);
   }
-  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'), { step: CONFIG.maxIters });
+  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'), { step: CONFIG.maxIters, optimizer, bestValLoss });
 
   console.log('');
   console.log('═══════════════════════════════════════════════════════');

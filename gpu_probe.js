@@ -29,11 +29,15 @@ try {
   const koffi = (await import('koffi')).default;
   console.log('  koffi loaded OK');
 
-  const cudart = koffi.load('libcudart.so');
-  console.log('  libcudart.so loaded OK');
+  function tryLoad(...names) {
+    for (const n of names) { try { return koffi.load(n); } catch {} }
+    throw new Error(`Could not load any of: ${names.join(', ')}`);
+  }
+  const cudart = tryLoad('libcudart.so', 'libcudart.so.12');
+  console.log('  libcudart loaded OK');
 
-  const cublas = koffi.load('libcublas.so');
-  console.log('  libcublas.so loaded OK');
+  const cublas = tryLoad('libcublas.so', 'libcublas.so.12');
+  console.log('  libcublas loaded OK');
 
   // Init
   const cudaMalloc = cudart.func('int cudaMalloc(_Out_ void** devPtr, size_t size)');
