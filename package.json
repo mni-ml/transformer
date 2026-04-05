@@ -3,7 +3,8 @@
   "type": "module",
   "scripts": {
     "download": "node prepare.js",
-    "train": "node train.js"
+    "train": "node train.js",
+    "generate": "node generate.js"
   },
   "dependencies": {
     "@mni-ml/framework": "^0.0.3"
