@@ -2,6 +2,7 @@
   "name": "mini-gpt",
   "type": "module",
   "scripts": {
+    "download": "node prepare.js",
     "train": "node train.js"
   },
   "dependencies": {

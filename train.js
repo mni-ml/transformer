@@ -2,32 +2,153 @@ import {
   Tensor, TensorData,
   Module, Parameter,
   Linear, Embedding,
-  SGD,
   softmax, crossEntropyLoss, destroyPool,
 } from '@mni-ml/framework';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ════════════════════════════════════════════════════════════════
 // Configuration
 // ════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  nEmbd: 32,
-  nHead: 2,
-  nLayer: 2,
-  blockSize: 16,
+  nEmbd: 64,
+  nHead: 4,
+  nLayer: 3,
+  blockSize: 32,
   batchSize: 4,
-  lr: 0.01,
-  maxIters: 200,
-  evalInterval: 10,
-  generateEvery: 50,
-  generateLen: 80,
+  maxIters: 3000,
+  evalInterval: 100,
+  evalIters: 5,
+  generateEvery: 500,
+  generateLen: 150,
+
+  lr: 6e-4,
+  beta1: 0.9,
+  beta2: 0.95,
+  weightDecay: 0.01,
+
+  warmupSteps: 100,
+  minLr: 6e-5,
+  maxGradNorm: 1.0,
+
+  checkpointEvery: 500,
+  modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
 };
 
+for (const [key, envKey] of [
+  ['maxIters', 'MAX_ITERS'], ['batchSize', 'BATCH_SIZE'],
+  ['nEmbd', 'N_EMBD'], ['nHead', 'N_HEAD'], ['nLayer', 'N_LAYER'],
+  ['blockSize', 'BLOCK_SIZE'], ['lr', 'LR'],
+]) {
+  if (process.env[envKey]) CONFIG[key] = Number(process.env[envKey]);
+}
+
 // ════════════════════════════════════════════════════════════════
-// Training Data
+// Adam Optimizer
+//
+// Follows the same raw-storage pattern as the framework's SGD:
+// read contiguous gradient and value arrays, compute updates
+// element-by-element, write a new Tensor back to the Parameter.
 // ════════════════════════════════════════════════════════════════
 
-const TEXT = `twinkle twinkle little star how i wonder what you are
+class Adam {
+  constructor(parameters, { lr = 6e-4, beta1 = 0.9, beta2 = 0.95, eps = 1e-8, weightDecay = 0 } = {}) {
+    this.parameters = parameters;
+    this.lr = lr;
+    this.beta1 = beta1;
+    this.beta2 = beta2;
+    this.eps = eps;
+    this.weightDecay = weightDecay;
+    this.t = 0;
+    this.m = parameters.map(p => new Float64Array(p.value.size));
+    this.v = parameters.map(p => new Float64Array(p.value.size));
+  }
+
+  zeroGrad() {
+    for (const p of this.parameters) {
+      if (p.value && typeof p.value === 'object' && 'grad' in p.value && p.value.grad != null) {
+        p.value.grad = null;
+      }
+    }
+  }
+
+  step() {
+    this.t++;
+    const { beta1, beta2, eps, weightDecay, lr } = this;
+    const bc1 = 1 - beta1 ** this.t;
+    const bc2 = 1 - beta2 ** this.t;
+
+    for (let i = 0; i < this.parameters.length; i++) {
+      const p = this.parameters[i];
+      if (!(p.value instanceof Tensor) || !p.value.grad) continue;
+
+      const grad = p.value.grad.contiguous();
+      const val = p.value.contiguous();
+      const gs = grad.data.storage;
+      const vs = val.data.storage;
+      const m = this.m[i];
+      const v = this.v[i];
+      const out = new Float64Array(val.size);
+
+      for (let j = 0; j < val.size; j++) {
+        const g = weightDecay > 0 ? gs[j] + weightDecay * vs[j] : gs[j];
+        m[j] = beta1 * m[j] + (1 - beta1) * g;
+        v[j] = beta2 * v[j] + (1 - beta2) * g * g;
+        out[j] = vs[j] - lr * (m[j] / bc1) / (Math.sqrt(v[j] / bc2) + eps);
+      }
+
+      p.update(new Tensor(new TensorData(out, [...val.shape])));
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Gradient Clipping (global norm)
+// ════════════════════════════════════════════════════════════════
+
+function clipGradNorm(parameters, maxNorm) {
+  let normSq = 0;
+  const grads = [];
+  for (const p of parameters) {
+    if (!(p.value instanceof Tensor) || !p.value.grad) { grads.push(null); continue; }
+    const g = p.value.grad.contiguous();
+    grads.push(g);
+    const s = g.data.storage;
+    for (let i = 0; i < s.length; i++) normSq += s[i] * s[i];
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm > maxNorm) {
+    const scale = maxNorm / norm;
+    for (let i = 0; i < parameters.length; i++) {
+      if (!grads[i]) continue;
+      const s = grads[i].data.storage;
+      const scaled = new Float64Array(s.length);
+      for (let j = 0; j < s.length; j++) scaled[j] = s[j] * scale;
+      parameters[i].value.grad = new Tensor(new TensorData(scaled, [...grads[i].shape]));
+    }
+  }
+  return norm;
+}
+
+// ════════════════════════════════════════════════════════════════
+// Learning Rate Schedule (linear warmup + cosine decay)
+// ════════════════════════════════════════════════════════════════
+
+function getLR(step, warmup, total, maxLr, minLr) {
+  if (step < warmup) return maxLr * (step + 1) / warmup;
+  const progress = (step - warmup) / Math.max(1, total - warmup);
+  return minLr + (maxLr - minLr) * 0.5 * (1 + Math.cos(Math.PI * progress));
+}
+
+// ════════════════════════════════════════════════════════════════
+// Data Loading
+// ════════════════════════════════════════════════════════════════
+
+const FALLBACK_TEXT = `twinkle twinkle little star how i wonder what you are
 up above the world so high like a diamond in the sky
 twinkle twinkle little star how i wonder what you are
 jack and jill went up the hill to fetch a pail of water
@@ -48,6 +169,62 @@ roses are red violets are blue sugar is sweet and so are you
 the quick brown fox jumps over the lazy dog
 the quick brown fox jumps over the lazy dog`.trim();
 
+function loadTrainingText() {
+  const dataPath = join(__dirname, 'data', 'input.txt');
+  if (existsSync(dataPath)) {
+    console.log(`  Loading data from ${dataPath}`);
+    return readFileSync(dataPath, 'utf-8');
+  }
+  console.log('  WARNING: data/input.txt not found — run "node prepare.js" first');
+  console.log('  Falling back to built-in 1KB training text\n');
+  return FALLBACK_TEXT;
+}
+
+// ════════════════════════════════════════════════════════════════
+// Model Serialization
+//
+// Saves all parameter weights + tokenizer + config to a JSON file
+// so the trained model can be loaded later for generation.
+// ════════════════════════════════════════════════════════════════
+
+function saveModel(model, tokenizer, path) {
+  const namedParams = model.namedParameters();
+  const params = {};
+  for (const [name, param] of namedParams) {
+    const t = param.value.contiguous();
+    params[name] = {
+      shape: [...t.shape],
+      data: Array.from(t.data.storage),
+    };
+  }
+  const checkpoint = {
+    config: model.config,
+    tokenizer: { stoi: tokenizer.stoi, itos: tokenizer.itos, vocabSize: tokenizer.vocabSize },
+    parameters: params,
+  };
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(checkpoint));
+  const sizeMB = (Buffer.byteLength(JSON.stringify(checkpoint)) / 1024 / 1024).toFixed(1);
+  console.log(`  Model saved to ${path} (${sizeMB} MB)`);
+}
+
+function loadModel(path) {
+  const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
+  const tokenizer = new CharTokenizer('');
+  Object.assign(tokenizer, checkpoint.tokenizer);
+
+  const model = new MiniGPT(tokenizer.vocabSize, checkpoint.config);
+  const namedParams = model.namedParameters();
+  for (const [name, param] of namedParams) {
+    if (checkpoint.parameters[name]) {
+      const { shape, data } = checkpoint.parameters[name];
+      param.update(new Tensor(new TensorData(new Float64Array(data), shape)));
+    }
+  }
+  console.log(`  Model loaded from ${path}`);
+  return { model, tokenizer, config: checkpoint.config };
+}
+
 // ════════════════════════════════════════════════════════════════
 // Character-Level Tokenizer
 // ════════════════════════════════════════════════════════════════
@@ -66,9 +243,8 @@ class CharTokenizer {
 // ════════════════════════════════════════════════════════════════
 // Layer Normalization
 //
-// Not built into the framework, so we compose it from primitives:
-//   y = (x - mean) / sqrt(var + eps) * gamma + beta
-// Using the log-exp trick for 1/sqrt: exp(-0.5 * ln(var + eps))
+// Composed from primitives: y = (x - mean) / sqrt(var + eps) * γ + β
+// Uses log-exp trick for 1/sqrt: exp(-0.5 * ln(var + eps))
 // ════════════════════════════════════════════════════════════════
 
 class LayerNorm extends Module {
@@ -89,13 +265,6 @@ class LayerNorm extends Module {
 
 // ════════════════════════════════════════════════════════════════
 // Causal Self-Attention (Multi-Head)
-//
-// Core of the transformer: each token attends to all previous tokens
-// (and itself) through multiple parallel attention heads.
-//
-//   Q, K, V = linear_projections(x)
-//   attention = softmax(Q @ K^T / sqrt(d_k) + causal_mask)
-//   output = attention @ V
 // ════════════════════════════════════════════════════════════════
 
 function createCausalMask(size) {
@@ -128,17 +297,14 @@ class CausalSelfAttention extends Module {
     let k = this.keyProj.forward(x);
     let v = this.valueProj.forward(x);
 
-    // Reshape [B, S, E] → [B, S, nHead, headDim] then rearrange for attention
-    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);     // [B, H, S, d]
-    const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1); // [B, H, d, S]
-    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);     // [B, H, S, d]
+    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
+    const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
+    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
 
-    // Scaled dot-product attention with causal mask
     let att = q.matmul(kT).mul(scale);
     att = att.add(createCausalMask(S));
     att = softmax(att, 3);
 
-    // Weighted combination of values, then merge heads back
     let out = att.matmul(v);
     out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
 
@@ -147,10 +313,7 @@ class CausalSelfAttention extends Module {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Position-wise Feed-Forward Network
-//
-// Two linear layers with ReLU activation and a 4x expansion in the
-// hidden dimension — the "thinking" part of each transformer block.
+// Feed-Forward Network (4x hidden expansion with ReLU)
 // ════════════════════════════════════════════════════════════════
 
 class FeedForward extends Module {
@@ -165,10 +328,7 @@ class FeedForward extends Module {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Transformer Block
-//
-// Pre-norm architecture (like GPT-2): LayerNorm before each
-// sub-layer, with residual connections around both attention and FFN.
+// Transformer Block (pre-norm with residual connections)
 // ════════════════════════════════════════════════════════════════
 
 class TransformerBlock extends Module {
@@ -187,13 +347,7 @@ class TransformerBlock extends Module {
 }
 
 // ════════════════════════════════════════════════════════════════
-// MiniGPT — The Full Model
-//
-// Architecture mirrors GPT-2:
-//   1. Token embedding + learned positional embedding
-//   2. Stack of N transformer blocks
-//   3. Final LayerNorm
-//   4. Linear head projecting to vocabulary logits
+// MiniGPT Model (GPT-2 architecture)
 // ════════════════════════════════════════════════════════════════
 
 class MiniGPT extends Module {
@@ -262,11 +416,23 @@ function getBatch(data, blockSize, batchSize) {
   return { inputs, targets };
 }
 
-/**
- * Autoregressive text generation: feeds the model its own output
- * token by token, building up a sequence from a prompt.
- */
-function generate(model, tokenizer, prompt, maxTokens, temperature = 1.0) {
+function estimateLoss(model, tokenizer, trainData, valData, config) {
+  const losses = { train: 0, val: 0 };
+  for (const [name, data] of [['train', trainData], ['val', valData]]) {
+    let total = 0;
+    for (let i = 0; i < config.evalIters; i++) {
+      const { inputs, targets } = getBatch(data, config.blockSize, config.batchSize);
+      const logits = model.forward(inputs);
+      const targetOneHot = oneHot(targets, tokenizer.vocabSize);
+      const loss = crossEntropyLoss(logits, targetOneHot);
+      total += loss.item();
+    }
+    losses[name] = total / config.evalIters;
+  }
+  return losses;
+}
+
+function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
   let context = tokenizer.encode(prompt);
   const blockSize = model.config.blockSize;
 
@@ -281,13 +447,11 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 1.0) {
       lastLogits.push(logits.get([0, seqLen - 1, v]) / temperature);
     }
 
-    // Numerically stable softmax for sampling
     const maxLogit = Math.max(...lastLogits);
     const exps = lastLogits.map(l => Math.exp(l - maxLogit));
     const sumExps = exps.reduce((a, b) => a + b);
     const probs = exps.map(e => e / sumExps);
 
-    // Multinomial sampling
     const r = Math.random();
     let cumSum = 0;
     let nextToken = 0;
@@ -303,70 +467,120 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 1.0) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Training Loop
+// Training
 // ════════════════════════════════════════════════════════════════
 
 function main() {
   console.log('');
-  console.log('═══════════════════════════════════════════════════');
-  console.log('  MiniGPT — A Tiny Transformer Language Model');
-  console.log('═══════════════════════════════════════════════════');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('  MiniGPT — Training a Tiny Transformer LLM');
+  console.log('═══════════════════════════════════════════════════════');
   console.log('');
 
-  const tokenizer = new CharTokenizer(TEXT);
-  const data = tokenizer.encode(TEXT);
+  const text = loadTrainingText();
+  const tokenizer = new CharTokenizer(text);
+  const allData = tokenizer.encode(text);
+
+  const splitIdx = Math.floor(allData.length * 0.9);
+  const trainData = allData.slice(0, splitIdx);
+  const valData = allData.slice(splitIdx);
 
   console.log(`  Vocabulary:     ${tokenizer.vocabSize} unique characters`);
-  console.log(`  Training data:  ${TEXT.length} characters`);
-  console.log(`  Architecture:   ${CONFIG.nLayer} blocks, ${CONFIG.nHead} heads, ${CONFIG.nEmbd}-dim embeddings`);
+  console.log(`  Training data:  ${trainData.length.toLocaleString()} tokens (${(trainData.length / 1024).toFixed(1)} KB)`);
+  console.log(`  Validation:     ${valData.length.toLocaleString()} tokens`);
+  console.log(`  Architecture:   ${CONFIG.nLayer} blocks, ${CONFIG.nHead} heads, ${CONFIG.nEmbd}-dim`);
   console.log(`  Context window: ${CONFIG.blockSize} tokens`);
 
   const model = new MiniGPT(tokenizer.vocabSize, CONFIG);
   const params = model.parameters();
   const totalParams = params.reduce((sum, p) => sum + p.value.size, 0);
   console.log(`  Parameters:     ${totalParams.toLocaleString()}`);
-  console.log(`  Optimizer:      SGD (lr=${CONFIG.lr})`);
+  console.log(`  Optimizer:      Adam (lr=${CONFIG.lr}, β1=${CONFIG.beta1}, β2=${CONFIG.beta2})`);
+  console.log(`  Schedule:       ${CONFIG.warmupSteps} warmup → cosine decay to ${CONFIG.minLr}`);
+  console.log(`  Grad clipping:  max norm ${CONFIG.maxGradNorm}`);
+  console.log(`  Training:       ${CONFIG.maxIters} steps, batch=${CONFIG.batchSize}`);
   console.log('');
-  console.log('───────────────────────────────────────────────────');
+  console.log('─────────────────────────────────────────────────────────');
   console.log('  Training');
-  console.log('───────────────────────────────────────────────────');
+  console.log('─────────────────────────────────────────────────────────');
   console.log('');
 
-  const optimizer = new SGD(params, CONFIG.lr);
+  const optimizer = new Adam(params, {
+    lr: CONFIG.lr,
+    beta1: CONFIG.beta1,
+    beta2: CONFIG.beta2,
+    weightDecay: CONFIG.weightDecay,
+  });
+
   const startTime = Date.now();
+  let bestValLoss = Infinity;
 
   for (let iter = 0; iter < CONFIG.maxIters; iter++) {
-    const { inputs, targets } = getBatch(data, CONFIG.blockSize, CONFIG.batchSize);
+    optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
+
+    const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
 
     optimizer.zeroGrad();
     const logits = model.forward(inputs);
     const targetOneHot = oneHot(targets, tokenizer.vocabSize);
     const loss = crossEntropyLoss(logits, targetOneHot);
     loss.backward();
+
+    const gradNorm = clipGradNorm(params, CONFIG.maxGradNorm);
     optimizer.step();
 
     if (iter % CONFIG.evalInterval === 0) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`  step ${String(iter).padStart(4)} │ loss = ${loss.item().toFixed(4)} │ ${elapsed}s`);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+      const losses = estimateLoss(model, tokenizer, trainData, valData, CONFIG);
+      const marker = losses.val < bestValLoss ? ' *' : '';
+      if (losses.val < bestValLoss) bestValLoss = losses.val;
+      const etaSeconds = (CONFIG.maxIters - iter) * (Date.now() - startTime) / Math.max(1, iter) / 1000;
+      const eta = etaSeconds > 3600
+        ? `${(etaSeconds / 3600).toFixed(1)}h`
+        : `${(etaSeconds / 60).toFixed(0)}m`;
+      console.log(
+        `  step ${String(iter).padStart(5)} │` +
+        ` train ${losses.train.toFixed(4)} │` +
+        ` val ${losses.val.toFixed(4)}${marker} │` +
+        ` lr ${optimizer.lr.toExponential(1)} │` +
+        ` gnorm ${gradNorm.toFixed(1)} │` +
+        ` ${elapsed}s (eta ${eta})`
+      );
     }
 
     if (iter > 0 && iter % CONFIG.generateEvery === 0) {
-      const sample = generate(model, tokenizer, 'the ', CONFIG.generateLen, 0.8);
-      console.log(`           │ sample: "${sample}"`);
+      const sample = generate(model, tokenizer, '\n', CONFIG.generateLen);
       console.log('');
+      console.log('  ── sample ──────────────────────────────────────────');
+      for (const line of sample.split('\n').slice(0, 6)) {
+        console.log(`  ${line}`);
+      }
+      console.log('  ───────────────────────────────────────────────────');
+      console.log('');
+    }
+
+    if (iter > 0 && iter % CONFIG.checkpointEvery === 0) {
+      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`));
     }
   }
 
   console.log('');
-  console.log('───────────────────────────────────────────────────');
+  console.log('─────────────────────────────────────────────────────────');
   console.log('  Final Generation (temperature=0.8)');
-  console.log('───────────────────────────────────────────────────');
+  console.log('─────────────────────────────────────────────────────────');
   console.log('');
-  console.log(generate(model, tokenizer, 'the ', CONFIG.generateLen * 2, 0.8));
+  const finalText = generate(model, tokenizer, '\n', CONFIG.generateLen * 2);
+  for (const line of finalText.split('\n').slice(0, 12)) {
+    console.log(`  ${line}`);
+  }
+  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'));
+
   console.log('');
-  console.log('═══════════════════════════════════════════════════');
-  console.log(`  Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
-  console.log('═══════════════════════════════════════════════════');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Best val loss: ${bestValLoss.toFixed(4)}`);
+  console.log(`  Total time:    ${((Date.now() - startTime) / 1000 / 60).toFixed(1)} minutes`);
+  console.log(`  Model saved:   ${join(CONFIG.modelDir, 'model-final.json')}`);
+  console.log('═══════════════════════════════════════════════════════');
 
   destroyPool();
 }
