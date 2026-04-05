@@ -1,0 +1,10 @@
+{
+  "name": "mini-gpt",
+  "type": "module",
+  "scripts": {
+    "train": "node train.js"
+  },
+  "dependencies": {
+    "@mni-ml/framework": "^0.0.3"
+  }
+}
