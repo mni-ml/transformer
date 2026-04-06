@@ -1,8 +1,9 @@
 import {
-  Tensor, TensorData,
+  Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, crossEntropyLoss, destroyPool, destroyDevice, gelu, dropout,
+  softmax, crossEntropyLoss, gelu, dropout, layerNorm,
+  Adam,
 } from '@mni-ml/framework';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -15,17 +16,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  nEmbd: 256,
-  nHead: 8,
-  nLayer: 4,
-  blockSize: 128,
-  batchSize: 4,
+  nEmbd: 384,
+  nHead: 6,
+  nLayer: 6,
+  blockSize: 256,
+  batchSize: 64,
   gradAccumSteps: 1,
   maxIters: 5000,
   evalInterval: 500,
-  evalIters: 10,
-  logInterval: 50,
-  generateEvery: 1000,
+  evalIters: 3,
+  logInterval: 10,
+  generateEvery: 500,
   generateLen: 300,
 
   lr: 1e-3,
@@ -53,86 +54,29 @@ for (const [key, envKey] of [
 const NO_RESUME = process.env.NO_RESUME === '1';
 
 // ════════════════════════════════════════════════════════════════
-// Adam Optimizer
+// Gradient Clipping (uses native)
 // ════════════════════════════════════════════════════════════════
 
-class Adam {
-  constructor(parameters, { lr = 6e-4, beta1 = 0.9, beta2 = 0.95, eps = 1e-8, weightDecay = 0 } = {}) {
-    this.parameters = parameters;
-    this.lr = lr;
-    this.beta1 = beta1;
-    this.beta2 = beta2;
-    this.eps = eps;
-    this.weightDecay = weightDecay;
-    this.t = 0;
-    this.m = parameters.map(p => new Float64Array(p.value.size));
-    this.v = parameters.map(p => new Float64Array(p.value.size));
-  }
-
-  zeroGrad() {
-    for (const p of this.parameters) {
-      if (p.value && typeof p.value === 'object' && 'grad' in p.value && p.value.grad != null) {
-        p.value.grad = null;
-      }
-    }
-  }
-
-  step() {
-    this.t++;
-    const { beta1, beta2, eps, weightDecay, lr } = this;
-    const bc1 = 1 - beta1 ** this.t;
-    const bc2 = 1 - beta2 ** this.t;
-
-    for (let i = 0; i < this.parameters.length; i++) {
-      const p = this.parameters[i];
-      if (!(p.value instanceof Tensor) || !p.value.grad) continue;
-
-      const grad = p.value.grad.contiguous();
-      const val = p.value.contiguous();
-      const gs = grad.data.storage;
-      const vs = val.data.storage;
-      const m = this.m[i];
-      const v = this.v[i];
-      const out = new Float64Array(val.size);
-
-      for (let j = 0; j < val.size; j++) {
-        const g = weightDecay > 0 ? gs[j] + weightDecay * vs[j] : gs[j];
-        m[j] = beta1 * m[j] + (1 - beta1) * g;
-        v[j] = beta2 * v[j] + (1 - beta2) * g * g;
-        out[j] = vs[j] - lr * (m[j] / bc1) / (Math.sqrt(v[j] / bc2) + eps);
-      }
-
-      p.update(new Tensor(new TensorData(out, [...val.shape])));
-    }
-  }
-}
-
-// ════════════════════════════════════════════════════════════════
-// Gradient Clipping (global norm)
-// ════════════════════════════════════════════════════════════════
-
-function clipGradNorm(parameters, maxNorm) {
-  let normSq = 0;
-  const grads = [];
-  for (const p of parameters) {
-    if (!(p.value instanceof Tensor) || !p.value.grad) { grads.push(null); continue; }
-    const g = p.value.grad.contiguous();
-    grads.push(g);
-    const s = g.data.storage;
-    for (let i = 0; i < s.length; i++) normSq += s[i] * s[i];
-  }
-  const norm = Math.sqrt(normSq);
+function clipGradNorm(paramTensors, maxNorm) {
+  const ids = paramTensors.map(t => t._id);
+  const norm = native.gradNorm(ids);
   if (norm > maxNorm) {
-    const scale = maxNorm / norm;
-    for (let i = 0; i < parameters.length; i++) {
-      if (!grads[i]) continue;
-      const s = grads[i].data.storage;
-      const scaled = new Float64Array(s.length);
-      for (let j = 0; j < s.length; j++) scaled[j] = s[j] * scale;
-      parameters[i].value.grad = new Tensor(new TensorData(scaled, [...grads[i].shape]));
-    }
+    native.clipGradNorm(ids, maxNorm);
   }
   return norm;
+}
+
+function gcKeepParams(params) {
+  const keepIds = [];
+  for (const p of params) {
+    keepIds.push(p.value._id);
+    const g = native.getGrad(p.value._id);
+    if (g !== null && g !== undefined) keepIds.push(g);
+  }
+  for (const mask of _causalMaskCache.values()) {
+    keepIds.push(mask._id);
+  }
+  native.gcTensors(keepIds);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -152,22 +96,6 @@ function getLR(step, warmup, total, maxLr, minLr) {
 const FALLBACK_TEXT = `twinkle twinkle little star how i wonder what you are
 up above the world so high like a diamond in the sky
 twinkle twinkle little star how i wonder what you are
-jack and jill went up the hill to fetch a pail of water
-jack fell down and broke his crown and jill came tumbling after
-up jack got and home did trot as fast as he could caper
-humpty dumpty sat on a wall humpty dumpty had a great fall
-all the kings horses and all the kings men
-could not put humpty together again
-mary had a little lamb its fleece was white as snow
-and everywhere that mary went the lamb was sure to go
-it followed her to school one day which was against the rules
-it made the children laugh and play to see a lamb at school
-baa baa black sheep have you any wool
-yes sir yes sir three bags full
-one for the master and one for the dame
-and one for the little boy who lives down the lane
-roses are red violets are blue sugar is sweet and so are you
-the quick brown fox jumps over the lazy dog
 the quick brown fox jumps over the lazy dog`.trim();
 
 function loadTrainingText() {
@@ -177,7 +105,6 @@ function loadTrainingText() {
     return readFileSync(dataPath, 'utf-8');
   }
   console.log('  WARNING: data/input.txt not found — run "node prepare.js" first');
-  console.log('  Falling back to built-in 1KB training text\n');
   return FALLBACK_TEXT;
 }
 
@@ -189,10 +116,10 @@ function saveModel(model, tokenizer, path, { step = -1, optimizer = null, bestVa
   const namedParams = model.namedParameters();
   const params = {};
   for (const [name, param] of namedParams) {
-    const t = param.value.contiguous();
+    const data = param.value.toFloat32();
     params[name] = {
-      shape: [...t.shape],
-      data: Array.from(t.data.storage),
+      shape: [...param.value.shape],
+      data: Array.from(data),
     };
   }
   const checkpoint = {
@@ -203,11 +130,7 @@ function saveModel(model, tokenizer, path, { step = -1, optimizer = null, bestVa
     bestValLoss,
   };
   if (optimizer) {
-    checkpoint.optimizer = {
-      t: optimizer.t,
-      m: optimizer.m.map(arr => Array.from(arr)),
-      v: optimizer.v.map(arr => Array.from(arr)),
-    };
+    checkpoint.optimizer = { t: optimizer.t };
   }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(checkpoint));
@@ -225,7 +148,9 @@ function loadModel(path) {
   for (const [name, param] of namedParams) {
     if (checkpoint.parameters[name]) {
       const { shape, data } = checkpoint.parameters[name];
-      param.update(new Tensor(new TensorData(new Float64Array(data), shape)));
+      const t = Tensor.fromFloat32(new Float32Array(data), shape);
+      t.setRequiresGrad(true);
+      param.update(t);
     }
   }
   console.log(`  Model loaded from ${path}`);
@@ -267,22 +192,20 @@ class CharTokenizer {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Layer Normalization
+// Layer Normalization (uses native fused kernel)
 // ════════════════════════════════════════════════════════════════
 
 class LayerNorm extends Module {
   constructor(dim) {
     super();
-    this.gamma = new Parameter(Tensor.ones([dim]));
-    this.beta = new Parameter(Tensor.zeros([dim]));
+    this.dim = dim;
+    const gammaData = new Float32Array(dim).fill(1.0);
+    this.gamma = new Parameter(Tensor.fromFloat32(gammaData, [dim]).setRequiresGrad(true));
+    const betaData = new Float32Array(dim).fill(0.0);
+    this.beta = new Parameter(Tensor.fromFloat32(betaData, [dim]).setRequiresGrad(true));
   }
   forward(x) {
-    const lastDim = x.dims - 1;
-    const mean = x.mean(lastDim);
-    const centered = x.sub(mean);
-    const variance = centered.mul(centered).mean(lastDim);
-    const invStd = variance.add(1e-5).log().mul(-0.5).exp();
-    return centered.mul(invStd).mul(this.gamma.value).add(this.beta.value);
+    return layerNorm(x, this.gamma.value, this.beta.value, 1e-5);
   }
 }
 
@@ -293,13 +216,13 @@ class LayerNorm extends Module {
 const _causalMaskCache = new Map();
 function getCausalMask(size) {
   if (_causalMaskCache.has(size)) return _causalMaskCache.get(size);
-  const storage = new Float64Array(size * size);
+  const storage = new Float32Array(size * size);
   for (let i = 0; i < size; i++) {
     for (let j = 0; j < size; j++) {
       storage[i * size + j] = j <= i ? 0.0 : -1e9;
     }
   }
-  const mask = new Tensor(new TensorData(storage, [1, 1, size, size]));
+  const mask = Tensor.fromFloat32(storage, [1, 1, size, size]);
   _causalMaskCache.set(size, mask);
   return mask;
 }
@@ -317,27 +240,27 @@ class CausalSelfAttention extends Module {
     this.outProj = new Linear(nEmbd, nEmbd);
   }
 
-  async forward(x) {
+  forward(x) {
     const [B, S, E] = x.shape;
     const { nHead, headDim, scale } = this;
 
-    let q = await this.queryProj.forward(x);
-    let k = await this.keyProj.forward(x);
-    let v = await this.valueProj.forward(x);
+    let q = this.queryProj.forward(x);
+    let k = this.keyProj.forward(x);
+    let v = this.valueProj.forward(x);
 
     q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
     const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
 
-    let att = (await q.matmul(kT)).mul(scale);
+    let att = q.matmul(kT).mul(scale);
     att = att.add(getCausalMask(S));
     att = softmax(att, 3);
     att = dropout(att, this.dropoutRate, !this.training);
 
-    let out = await att.matmul(v);
+    let out = att.matmul(v);
     out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
 
-    return await this.outProj.forward(out);
+    return this.outProj.forward(out);
   }
 }
 
@@ -352,10 +275,10 @@ class FeedForward extends Module {
     this.fc1 = new Linear(nEmbd, 4 * nEmbd);
     this.fc2 = new Linear(4 * nEmbd, nEmbd);
   }
-  async forward(x) {
-    let h = await this.fc1.forward(x);
+  forward(x) {
+    let h = this.fc1.forward(x);
     h = gelu(h);
-    h = await this.fc2.forward(h);
+    h = this.fc2.forward(h);
     return dropout(h, this.dropoutRate, !this.training);
   }
 }
@@ -372,9 +295,9 @@ class TransformerBlock extends Module {
     this.ln2 = new LayerNorm(nEmbd);
     this.ffn = new FeedForward(nEmbd, dropoutRate);
   }
-  async forward(x) {
-    x = x.add(await this.attn.forward(this.ln1.forward(x)));
-    x = x.add(await this.ffn.forward(this.ln2.forward(x)));
+  forward(x) {
+    x = x.add(this.attn.forward(this.ln1.forward(x)));
+    x = x.add(this.ffn.forward(this.ln2.forward(x)));
     return x;
   }
 }
@@ -398,10 +321,10 @@ class MiniGPT extends Module {
     }
 
     this.lnFinal = new LayerNorm(nEmbd);
-    this.headBias = new Parameter(Tensor.zeros([vocabSize]));
+    this.headBias = new Parameter(Tensor.zeros([vocabSize]).setRequiresGrad(true));
   }
 
-  async forward(indices) {
+  forward(indices) {
     const batch = indices.length;
     const seqLen = indices[0].length;
 
@@ -414,31 +337,18 @@ class MiniGPT extends Module {
     x = x.add(this.posEmb.forward(posIndices));
 
     for (let i = 0; i < this.config.nLayer; i++) {
-      x = await this[`block${i}`].forward(x);
+      x = this[`block${i}`].forward(x);
     }
 
     x = this.lnFinal.forward(x);
-    // Weight tying: reuse token embedding transposed as output projection
     const wT = this.tokenEmb.weight.value.permute(1, 0);
-    return (await x.matmul(wT)).add(this.headBias.value);
+    return x.matmul(wT).add(this.headBias.value);
   }
 }
 
 // ════════════════════════════════════════════════════════════════
 // Utilities
 // ════════════════════════════════════════════════════════════════
-
-function oneHot(indices, numClasses) {
-  const batch = indices.length;
-  const seq = indices[0].length;
-  const storage = new Float64Array(batch * seq * numClasses);
-  for (let b = 0; b < batch; b++) {
-    for (let s = 0; s < seq; s++) {
-      storage[(b * seq + s) * numClasses + indices[b][s]] = 1.0;
-    }
-  }
-  return new Tensor(new TensorData(storage, [batch, seq, numClasses]));
-}
 
 function getBatch(data, blockSize, batchSize) {
   const inputs = [];
@@ -451,44 +361,44 @@ function getBatch(data, blockSize, batchSize) {
   return { inputs, targets };
 }
 
-async function estimateLoss(model, tokenizer, trainData, valData, config) {
+function estimateLoss(model, tokenizer, trainData, valData, config, params) {
   model.eval();
+  native.noGradStart();
   const losses = { train: 0, val: 0 };
   for (const [name, data] of [['train', trainData], ['val', valData]]) {
     let total = 0;
     for (let i = 0; i < config.evalIters; i++) {
       const { inputs, targets } = getBatch(data, config.blockSize, config.batchSize);
-      const logits = await model.forward(inputs);
-      const targetOneHot = oneHot(targets, tokenizer.vocabSize);
-      const loss = crossEntropyLoss(logits, targetOneHot);
+      const logits = model.forward(inputs);
+      const loss = crossEntropyLoss(logits, targets);
       total += loss.item();
-      loss.history = null;
-      logits.history = null;
+      gcKeepParams(params);
     }
     losses[name] = total / config.evalIters;
   }
+  native.noGradEnd();
   model.train();
   return losses;
 }
 
-async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
+function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params = null) {
   model.eval();
+  native.noGradStart();
   let context = tokenizer.encode(prompt);
   const blockSize = model.config.blockSize;
 
   for (let i = 0; i < maxTokens; i++) {
     const ctxWindow = context.slice(-blockSize);
-    const logits = await model.forward([ctxWindow]);
+    const logits = model.forward([ctxWindow]);
 
     const seqLen = ctxWindow.length;
     const vocabSize = tokenizer.vocabSize;
+    const lastLogitsData = logits.toFloat32();
+    const offset = (seqLen - 1) * vocabSize;
     const lastLogits = [];
     for (let v = 0; v < vocabSize; v++) {
-      lastLogits.push(logits.get([0, seqLen - 1, v]) / temperature);
+      lastLogits.push(lastLogitsData[offset + v] / temperature);
     }
-
-    // Release autograd graph — we only need the extracted values
-    logits.history = null;
 
     const maxLogit = Math.max(...lastLogits);
     const exps = lastLogits.map(l => Math.exp(l - maxLogit));
@@ -504,8 +414,10 @@ async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) 
     }
 
     context.push(nextToken);
+    if (params) gcKeepParams(params);
   }
 
+  native.noGradEnd();
   model.train();
   return tokenizer.decode(context);
 }
@@ -514,10 +426,10 @@ async function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) 
 // Training
 // ════════════════════════════════════════════════════════════════
 
-async function main() {
+function main() {
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
-  console.log('  MiniGPT — Training a Tiny Transformer LLM');
+  console.log('  MiniGPT — Rust+CUDA Native Backend');
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
 
@@ -561,7 +473,7 @@ async function main() {
   console.log(`  Optimizer:      Adam (lr=${CONFIG.lr}, β1=${CONFIG.beta1}, β2=${CONFIG.beta2})`);
   console.log(`  Schedule:       ${CONFIG.warmupSteps} warmup → cosine decay to ${CONFIG.minLr}`);
   console.log(`  Grad clipping:  max norm ${CONFIG.maxGradNorm}`);
-  console.log(`  Training:       steps ${startStep}→${CONFIG.maxIters}, micro-batch=${CONFIG.batchSize}, accum=${CONFIG.gradAccumSteps} (effective ${effectiveBatch})`);
+  console.log(`  Training:       steps ${startStep}→${CONFIG.maxIters}, batch=${CONFIG.batchSize}, accum=${CONFIG.gradAccumSteps} (effective ${effectiveBatch})`);
   console.log('');
   console.log('─────────────────────────────────────────────────────────');
   console.log(`  Training${startStep > 0 ? ` (resuming from step ${startStep})` : ''}`);
@@ -576,18 +488,15 @@ async function main() {
   });
   if (savedOptimizerState) {
     optimizer.t = savedOptimizerState.t;
-    for (let i = 0; i < savedOptimizerState.m.length && i < optimizer.m.length; i++) {
-      optimizer.m[i] = new Float64Array(savedOptimizerState.m[i]);
-      optimizer.v[i] = new Float64Array(savedOptimizerState.v[i]);
-    }
     console.log(`  Optimizer state restored (t=${optimizer.t})`);
   }
 
+  const paramTensors = params.map(p => p.value);
+
   const startTime = Date.now();
-  let stepStart = Date.now();
 
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
-    stepStart = Date.now();
+    const stepStart = Date.now();
     optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
 
     optimizer.zeroGrad();
@@ -595,23 +504,21 @@ async function main() {
 
     for (let microStep = 0; microStep < CONFIG.gradAccumSteps; microStep++) {
       const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
-      const logits = await model.forward(inputs);
-      const targetOneHot = oneHot(targets, tokenizer.vocabSize);
-      const loss = crossEntropyLoss(logits, targetOneHot);
+      const logits = model.forward(inputs);
+      const loss = crossEntropyLoss(logits, targets);
       const scaledLoss = loss.mul(1 / CONFIG.gradAccumSteps);
-      await scaledLoss.backward();
+      scaledLoss.backward();
       accumLoss += loss.item();
-      loss.history = null;
-      logits.history = null;
-      scaledLoss.history = null;
       if (iter === startStep && microStep === 0) {
-        console.log(`  [first micro-batch done: ${((Date.now() - stepStart) / 1000).toFixed(1)}s, loss=${(accumLoss).toFixed(4)}]`);
+        console.log(`  [first micro-batch done: ${((Date.now() - stepStart) / 1000).toFixed(1)}s, loss=${accumLoss.toFixed(4)}]`);
       }
+      gcKeepParams(params);
     }
     accumLoss /= CONFIG.gradAccumSteps;
 
-    const gradNorm = clipGradNorm(params, CONFIG.maxGradNorm);
+    const gradNorm = clipGradNorm(paramTensors, CONFIG.maxGradNorm);
     optimizer.step();
+    gcKeepParams(params);
 
     const stepMs = Date.now() - stepStart;
     const stepsCompleted = iter - startStep + 1;
@@ -624,7 +531,7 @@ async function main() {
         ` ${(stepMs / 1000).toFixed(1)}s/step │` +
         ` ${elapsed}s │ evaluating...`
       );
-      const losses = await estimateLoss(model, tokenizer, trainData, valData, CONFIG);
+      const losses = estimateLoss(model, tokenizer, trainData, valData, CONFIG, params);
       const marker = losses.val < bestValLoss ? ' *' : '';
       if (losses.val < bestValLoss) bestValLoss = losses.val;
       const avgStepMs = (Date.now() - startTime) / stepsCompleted;
@@ -650,7 +557,7 @@ async function main() {
     }
 
     if (iter > 0 && iter % CONFIG.generateEvery === 0) {
-      const sample = await generate(model, tokenizer, '\n', CONFIG.generateLen);
+      const sample = generate(model, tokenizer, '\n', CONFIG.generateLen, 0.8, params);
       console.log('');
       console.log('  ── sample ──────────────────────────────────────────');
       for (const line of sample.split('\n').slice(0, 6)) {
@@ -670,7 +577,7 @@ async function main() {
   console.log('  Final Generation (temperature=0.8)');
   console.log('─────────────────────────────────────────────────────────');
   console.log('');
-  const finalText = await generate(model, tokenizer, '\n', CONFIG.generateLen * 2);
+  const finalText = generate(model, tokenizer, '\n', CONFIG.generateLen * 2, 0.8, params);
   for (const line of finalText.split('\n').slice(0, 12)) {
     console.log(`  ${line}`);
   }
@@ -682,9 +589,6 @@ async function main() {
   console.log(`  Total time:    ${((Date.now() - startTime) / 1000 / 60).toFixed(1)} minutes`);
   console.log(`  Model saved:   ${join(CONFIG.modelDir, 'model-final.json')}`);
   console.log('═══════════════════════════════════════════════════════');
-
-  destroyPool();
-  destroyDevice();
 }
 
 main();
