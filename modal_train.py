@@ -18,9 +18,9 @@ import os
 
 import modal
 
-app = modal.App("mini-gpt-rust-cuda")
+app = modal.App("mini-gpt-optimized-test")
 
-vol = modal.Volume.from_name("mini-gpt-rust-cuda-vol", create_if_missing=True)
+vol = modal.Volume.from_name("mini-gpt-optimized-test-vol", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -90,5 +90,5 @@ def train(steps: int = 0, fresh: bool = False):
 @app.local_entrypoint()
 def main(steps: int = 0, fresh: bool = False):
     train.remote(steps=steps, fresh=fresh)
-    print("\nModel saved to Modal volume 'mini-gpt-rust-cuda-vol'.")
-    print("Download with:  modal volume get mini-gpt-rust-cuda-vol model-final.json")
+    print("\nModel saved to Modal volume 'mini-gpt-optimized-test-vol'.")
+    print("Download with:  modal volume get mini-gpt-optimized-test-vol model-final.json")
