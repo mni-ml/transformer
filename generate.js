@@ -10,7 +10,7 @@ import {
   Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, gelu, dropout, layerNorm,
+  softmax, gelu, dropout, layerNorm, flashAttention,
 } from '@mni-ml/framework';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -64,14 +64,13 @@ class CausalSelfAttention extends Module {
     let q = this.queryProj.forward(x);
     let k = this.keyProj.forward(x);
     let v = this.valueProj.forward(x);
-    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
-    const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
-    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
-    let att = q.matmul(kT).mul(scale);
-    att = att.add(getCausalMask(S));
-    att = softmax(att, 3);
-    let out = att.matmul(v);
-    out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
+
+    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
+    k = k.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
+    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
+
+    let out = flashAttention(q, k, v, scale, true);
+    out = out.view(B, nHead, S, headDim).permute(0, 2, 1, 3).contiguous().view(B, S, E);
     return this.outProj.forward(out);
   }
 }

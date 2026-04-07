@@ -2,7 +2,8 @@ import {
   Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, crossEntropyLoss, gelu, dropout, layerNorm,
+  softmax, crossEntropyLoss, crossEntropyLossGpu,
+  gelu, dropout, layerNorm, flashAttention,
   Adam,
 } from '@mni-ml/framework';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
@@ -54,7 +55,7 @@ for (const [key, envKey] of [
 const NO_RESUME = process.env.NO_RESUME === '1';
 
 // ════════════════════════════════════════════════════════════════
-// Gradient Clipping (uses native)
+// Gradient Clipping (legacy, kept for generate.js compat)
 // ════════════════════════════════════════════════════════════════
 
 function clipGradNorm(paramTensors, maxNorm) {
@@ -248,17 +249,13 @@ class CausalSelfAttention extends Module {
     let k = this.keyProj.forward(x);
     let v = this.valueProj.forward(x);
 
-    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
-    const kT = k.view(B, S, nHead, headDim).permute(0, 2, 3, 1);
-    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3);
+    // [B, S, nHead, D] -> [B*nHead, S, D] for flash attention
+    q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
+    k = k.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
+    v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
 
-    let att = q.matmul(kT).mul(scale);
-    att = att.add(getCausalMask(S));
-    att = softmax(att, 3);
-    att = dropout(att, this.dropoutRate, !this.training);
-
-    let out = att.matmul(v);
-    out = out.permute(0, 2, 1, 3).contiguous().view(B, S, E);
+    let out = flashAttention(q, k, v, scale, true);
+    out = out.view(B, nHead, S, headDim).permute(0, 2, 1, 3).contiguous().view(B, S, E);
 
     return this.outProj.forward(out);
   }
@@ -329,6 +326,24 @@ class MiniGPT extends Module {
     const seqLen = indices[0].length;
 
     let x = this.tokenEmb.forward(indices);
+
+    const posIndices = [];
+    for (let b = 0; b < batch; b++) {
+      posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
+    }
+    x = x.add(this.posEmb.forward(posIndices));
+
+    for (let i = 0; i < this.config.nLayer; i++) {
+      x = this[`block${i}`].forward(x);
+    }
+
+    x = this.lnFinal.forward(x);
+    const wT = this.tokenEmb.weight.value.permute(1, 0);
+    return x.matmul(wT).add(this.headBias.value);
+  }
+
+  forwardGpu(inputsIntId, batch, seqLen) {
+    let x = this.tokenEmb.forwardGpu(inputsIntId, batch, seqLen);
 
     const posIndices = [];
     for (let b = 0; b < batch; b++) {
@@ -493,6 +508,10 @@ function main() {
 
   const paramTensors = params.map(p => p.value);
 
+  // Upload tokenized data to GPU (zero-copy batch sampling)
+  const trainDatasetId = native.createDataset(new Int32Array(trainData));
+  console.log(`  GPU dataset uploaded: ${trainData.length.toLocaleString()} tokens`);
+
   const startTime = Date.now();
 
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
@@ -501,23 +520,26 @@ function main() {
 
     optimizer.zeroGrad();
     let accumLoss = 0;
+    const shouldLog = (iter === startStep) || (iter % CONFIG.logInterval === 0) || (iter % CONFIG.evalInterval === 0);
 
     for (let microStep = 0; microStep < CONFIG.gradAccumSteps; microStep++) {
-      const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
-      const logits = model.forward(inputs);
-      const loss = crossEntropyLoss(logits, targets);
+      const [inputsId, targetsId] = native.sampleBatch(trainDatasetId, CONFIG.blockSize, CONFIG.batchSize);
+      const logits = model.forwardGpu(inputsId, CONFIG.batchSize, CONFIG.blockSize);
+      const loss = crossEntropyLossGpu(logits, targetsId);
       const scaledLoss = loss.mul(1 / CONFIG.gradAccumSteps);
       scaledLoss.backward();
-      accumLoss += loss.item();
+      if (shouldLog) accumLoss += loss.item();
       if (iter === startStep && microStep === 0) {
+        if (!shouldLog) accumLoss = loss.item();
         console.log(`  [first micro-batch done: ${((Date.now() - stepStart) / 1000).toFixed(1)}s, loss=${accumLoss.toFixed(4)}]`);
       }
       gcKeepParams(params);
+      native.freeIntBuffer(inputsId);
+      native.freeIntBuffer(targetsId);
     }
-    accumLoss /= CONFIG.gradAccumSteps;
+    if (shouldLog) accumLoss /= CONFIG.gradAccumSteps;
 
-    const gradNorm = clipGradNorm(paramTensors, CONFIG.maxGradNorm);
-    optimizer.step();
+    const gradNorm = optimizer.step(CONFIG.maxGradNorm);
     gcKeepParams(params);
 
     const stepMs = Date.now() - stepStart;

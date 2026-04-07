@@ -1,13 +1,14 @@
 """
 Deploy MiniGPT training to Modal with Rust+CUDA native backend on A100 GPU.
 
-Uses cuBLAS for matmul, custom CUDA kernels for all other ops, and
-nvrtc for runtime PTX compilation.
+Uses cuBLAS for matmul, FlashAttention, GPU-resident data pipeline,
+block-parallel LayerNorm/Softmax, fused ops, and mixed-precision support.
 
 Usage:
   modal run modal_train.py              # full run (CUDA backend, A100)
   modal run modal_train.py --steps 100  # quick test run
   modal run modal_train.py --fresh      # ignore checkpoints, start fresh
+  modal run --detach modal_train.py     # run detached (survives client disconnect)
 
 After training, download the model:
   modal volume get mini-gpt-rust-cuda-vol model-final.json
