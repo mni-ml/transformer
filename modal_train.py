@@ -58,7 +58,7 @@ image = (
 
 @app.function(
     image=image,
-    timeout=8 * 60 * 60,
+    timeout=24 * 60 * 60,
     gpu="A100-80GB",
     memory=32768,
     volumes={"/app/out": vol},
