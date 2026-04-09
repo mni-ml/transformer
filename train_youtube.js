@@ -319,12 +319,12 @@ function estimateLoss(model, trainData, valData, config, params) {
 }
 
 const GENERATION_PROMPTS = [
-  "Today we're going to",
-  "So the first thing you need to know",
-  "In this video I want to talk about",
-  "Let me explain how",
-  "The most important thing is",
-  "What I found really interesting was",
+  "Once upon a time",
+  "There was a little girl named",
+  "One day, a boy named Tom",
+  "The sun was shining and",
+  "Lily and her mom went to the",
+  "Once there was a big bear who",
 ];
 
 function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params = null) {
