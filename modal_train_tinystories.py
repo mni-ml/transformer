@@ -16,11 +16,12 @@ Usage:
 """
 import subprocess
 import os
+import signal
 import modal
 
 app = modal.App("mini-gpt-tinystories")
 
-vol = modal.Volume.from_name("mini-gpt-tinystories-vol", create_if_missing=True)
+vol = modal.Volume.from_name("mini-gpt-tinystories-v3-vol", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -61,6 +62,13 @@ image = (
     volumes={"/app/out": vol},
 )
 def train(steps: int = 0, fresh: bool = False):
+    # Flush volume on SIGTERM so checkpoints survive preemption
+    def _flush(signum, frame):
+        print("\n  SIGTERM received — flushing volume...")
+        vol.commit()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _flush)
+
     env = dict(os.environ)
     env["MODEL_DIR"] = "/app/out"
     env["DATA_DIR"] = "/app/data"
@@ -71,7 +79,8 @@ def train(steps: int = 0, fresh: bool = False):
     env["BATCH_SIZE"] = "8"
     env["GRAD_ACCUM_STEPS"] = "4"
     env["CHECKPOINT_EVERY"] = "500"
-    env["MAX_ITERS"] = "20000"
+    env["LR"] = "3e-4"
+    env["MAX_ITERS"] = "7500"
     if fresh:
         env["NO_RESUME"] = "1"
     if steps > 0:
