@@ -21,7 +21,7 @@ import modal
 
 app = modal.App("mini-gpt-tinystories")
 
-vol = modal.Volume.from_name("mini-gpt-tinystories-v3-vol", create_if_missing=True)
+vol = modal.Volume.from_name("mini-gpt-tinystories-v4-vol", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -39,7 +39,7 @@ image = (
     .run_commands(
         'mkdir -p /app && cd /app && npm init -y'
         ' && node -e "const p=require(\'./package.json\');p.type=\'module\';require(\'fs\').writeFileSync(\'package.json\',JSON.stringify(p,null,2))"'
-        ' && npm install @mni-ml/framework@0.3.1 @mni-ml/framework-linux-x64-gnu-cuda@0.3.1'
+        ' && npm install @mni-ml/framework@0.3.3 @mni-ml/framework-linux-x64-gnu-cuda@0.3.3'
     )
     # ── Python: install HuggingFace deps for data download ───────
     .pip_install("datasets", "tokenizers")

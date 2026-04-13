@@ -122,6 +122,10 @@ function saveModel(model, tokPath, path, { step = -1, optimizer = null, bestValL
     step,
     bestValLoss,
   };
+  // We only save the step counter here. The per-parameter Adam m/v buffers
+  // live inside the Rust native backend and can't be exported yet.
+  // On resume we intentionally reset t=0 so bias correction compensates
+  // for the fresh m/v, giving well-behaved updates from the first step.
   if (optimizer) checkpoint.optimizer = { t: optimizer.t };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(checkpoint));
@@ -397,7 +401,7 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params
 function main() {
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
-  console.log('  MiniGPT — YouTube-Commons (BPE tokenizer)');
+  console.log('  MiniGPT — BPE tokenizer');
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
 
@@ -465,8 +469,10 @@ function main() {
     weightDecay: CONFIG.weightDecay,
   });
   if (savedOptimizerState) {
-    optimizer.t = savedOptimizerState.t;
-    console.log(`  Optimizer state restored (t=${optimizer.t})`);
+    // Adam m/v buffers can't be restored from checkpoint (they live in Rust).
+    // Keeping t=0 lets bias correction compensate for fresh m/v, avoiding
+    // the instability that comes from t=N with m=0,v=0.
+    console.log(`  Optimizer restarting fresh (checkpoint had t=${savedOptimizerState.t}, reset to 0 for stability)`);
   }
 
   const paramTensors = params.map(p => p.value);
