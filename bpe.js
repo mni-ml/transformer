@@ -62,14 +62,18 @@ export class BPETokenizer {
       this.idToToken[id] = tok;
     }
 
-    // added tokens (e.g. <|endoftext|>)
+    // added tokens (e.g. <|endoftext|>) — encode must emit a single id (HF parity)
+    /** @type {{ content: string, id: number }[]} */
+    this._addedByLength = [];
     if (raw.added_tokens) {
       for (const at of raw.added_tokens) {
         if (at.id !== undefined && at.content) {
           this.vocab[at.content] = at.id;
           this.idToToken[at.id] = at.content;
+          this._addedByLength.push({ content: at.content, id: at.id });
         }
       }
+      this._addedByLength.sort((a, b) => b.content.length - a.content.length);
     }
 
     this.vocabSize = Math.max(
@@ -77,11 +81,15 @@ export class BPETokenizer {
       ...Object.keys(this.idToToken).map(Number),
     ) + 1;
 
-    // merge priority: "tok1 tok2" → rank (lower = merge first)
+    // merge priority: "tok1 tok2" → rank (lower = merge first).
+    // HuggingFace tokenizer.json uses [["a","b"], ...]; GPT-2 merges.txt uses "a b" strings.
     this.bpeRanks = {};
     if (model.merges) {
       for (let i = 0; i < model.merges.length; i++) {
-        this.bpeRanks[model.merges[i]] = i;
+        const m = model.merges[i];
+        const key = Array.isArray(m) ? m.join(' ') : m;
+        if (typeof key === 'string' && key.startsWith('#')) continue;
+        this.bpeRanks[key] = i;
       }
     }
   }
@@ -91,6 +99,11 @@ export class BPETokenizer {
   encode(text) {
     if (!text) return [];
     const ids = [];
+    for (const { content, id } of this._addedByLength) {
+      if (text === content) {
+        return [id];
+      }
+    }
     const matches = text.match(GPT2_PAT);
     if (!matches) return ids;
 
