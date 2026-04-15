@@ -10,11 +10,12 @@ import {
   Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, gelu, dropout, layerNorm, flashAttention,
+  softmax, gelu, layerNorm, flashAttention,
 } from '@mni-ml/framework';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -69,7 +70,17 @@ class CausalSelfAttention extends Module {
     k = k.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
 
-    let out = flashAttention(q, k, v, scale, true);
+    let out;
+    if (typeof native.flashAttention === 'function') {
+      out = flashAttention(q, k, v, scale, true);
+    } else {
+      // CPU/native fallback when flashAttention kernel is unavailable.
+      let scores = q.matmul(k.permute(0, 2, 1)).mul(scale); // [B*H, S, S]
+      const mask = getCausalMask(S).view(S, S); // [S, S]
+      scores = scores.add(mask);
+      const probs = softmax(scores, -1);
+      out = probs.matmul(v);
+    }
     out = out.view(B, nHead, S, headDim).permute(0, 2, 1, 3).contiguous().view(B, S, E);
     return this.outProj.forward(out);
   }
@@ -135,11 +146,19 @@ class MiniGPT extends Module {
 
 // ── Load + Generate ─────────────────────────────────────────
 
-function loadModel(path) {
+function loadModel(path, tokenizerOverridePath = null) {
   const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
-  const tokenizer = checkpoint.tokenizer;
-  tokenizer.encode = (text) => [...text].map(ch => tokenizer.stoi[ch]);
-  tokenizer.decode = (indices) => indices.map(i => tokenizer.itos[i]).join('');
+  let tokenizer;
+  if (checkpoint.tokenizerPath || tokenizerOverridePath) {
+    const tokPath = tokenizerOverridePath || checkpoint.tokenizerPath;
+    tokenizer = new BPETokenizer(tokPath);
+  } else if (checkpoint.tokenizer) {
+    tokenizer = checkpoint.tokenizer;
+    tokenizer.encode = (text) => [...text].map(ch => tokenizer.stoi[ch]);
+    tokenizer.decode = (indices) => indices.map(i => tokenizer.itos[i]).join('');
+  } else {
+    throw new Error('Checkpoint has no tokenizer metadata. Pass tokenizer path as arg 5.');
+  }
 
   const model = new MiniGPT(tokenizer.vocabSize, checkpoint.config);
   for (const [name, param] of model.namedParameters()) {
@@ -167,20 +186,31 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
     const data = logits.toFloat32();
     const offset = (seqLen - 1) * vocabSize;
     const lastLogits = [];
-    for (let v = 0; v < vocabSize; v++)
-      lastLogits.push(data[offset + v] / temperature);
-
-    const maxLogit = Math.max(...lastLogits);
-    const exps = lastLogits.map(l => Math.exp(l - maxLogit));
-    const sumExps = exps.reduce((a, b) => a + b);
-    const probs = exps.map(e => e / sumExps);
-
-    const r = Math.random();
-    let cumSum = 0;
     let nextToken = 0;
-    for (let v = 0; v < vocabSize; v++) {
-      cumSum += probs[v];
-      if (r < cumSum) { nextToken = v; break; }
+    if (temperature <= 0) {
+      let best = -Infinity;
+      for (let v = 0; v < vocabSize; v++) {
+        const val = data[offset + v];
+        if (val > best) {
+          best = val;
+          nextToken = v;
+        }
+      }
+    } else {
+      for (let v = 0; v < vocabSize; v++)
+        lastLogits.push(data[offset + v] / temperature);
+
+      const maxLogit = Math.max(...lastLogits);
+      const exps = lastLogits.map(l => Math.exp(l - maxLogit));
+      const sumExps = exps.reduce((a, b) => a + b);
+      const probs = exps.map(e => e / sumExps);
+
+      const r = Math.random();
+      let cumSum = 0;
+      for (let v = 0; v < vocabSize; v++) {
+        cumSum += probs[v];
+        if (r < cumSum) { nextToken = v; break; }
+      }
     }
     context.push(nextToken);
   }
@@ -195,6 +225,7 @@ const modelPath = args[0] || join(__dirname, 'out', 'model-final.json');
 const prompt = args[1] || '\n';
 const numTokens = parseInt(args[2] || '300');
 const temperature = parseFloat(args[3] || '0.8');
+const tokenizerPath = args[4] || null;
 
 if (!existsSync(modelPath)) {
   console.error(`Model not found: ${modelPath}`);
@@ -203,7 +234,7 @@ if (!existsSync(modelPath)) {
 }
 
 console.log(`Loading model from ${modelPath}...`);
-const { model, tokenizer, config } = loadModel(modelPath);
+const { model, tokenizer, config } = loadModel(modelPath, tokenizerPath);
 console.log(`Model: ${config.nLayer} layers, ${config.nHead} heads, ${config.nEmbd}-dim`);
 console.log(`Generating ${numTokens} tokens (temperature=${temperature})...\n`);
 
