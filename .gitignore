@@ -12,5 +12,4 @@ npm-debug.log*
 
 framework/
 
-out/*
 !out/model-final.json
