@@ -11,3 +11,6 @@ npm-debug.log*
 *.tgz
 
 framework/
+
+out/*
+!out/model-final.json
