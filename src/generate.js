@@ -1,10 +1,10 @@
 /**
- * Load a saved MiniGPT checkpoint and generate text.
+ * Load a saved MiniGPT (BPE) checkpoint and generate text.
  *
  * Usage:
- *   npm run generate                          # uses out/model-final.json
+ *   npm run generate
  *   node src/generate.js out/checkpoint-1000.json
- *   node src/generate.js out/model-final.json "ROMEO:" 300 0.8
+ *   node src/generate.js out/model-final.json "<|endoftext|>" 300 0.8 data/tokenizer.json
  */
 import {
   Tensor, native,
@@ -20,7 +20,7 @@ import { BPETokenizer } from './bpe.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 
-// ── Model architecture (must match train.js) ────────────────
+// ── Model architecture (must match src/train.js) ───────────
 
 class LayerNorm extends Module {
   constructor(dim) {
@@ -149,17 +149,11 @@ class MiniGPT extends Module {
 
 function loadModel(path, tokenizerOverridePath = null) {
   const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
-  let tokenizer;
-  if (checkpoint.tokenizerPath || tokenizerOverridePath) {
-    const tokPath = tokenizerOverridePath || checkpoint.tokenizerPath;
-    tokenizer = new BPETokenizer(tokPath);
-  } else if (checkpoint.tokenizer) {
-    tokenizer = checkpoint.tokenizer;
-    tokenizer.encode = (text) => [...text].map(ch => tokenizer.stoi[ch]);
-    tokenizer.decode = (indices) => indices.map(i => tokenizer.itos[i]).join('');
-  } else {
-    throw new Error('Checkpoint has no tokenizer metadata. Pass tokenizer path as arg 5.');
+  const tokPath = tokenizerOverridePath || checkpoint.tokenizerPath;
+  if (!tokPath) {
+    throw new Error('Checkpoint has no tokenizerPath. Pass data/tokenizer.json as the 5th CLI argument.');
   }
+  const tokenizer = new BPETokenizer(tokPath);
 
   const model = new MiniGPT(tokenizer.vocabSize, checkpoint.config);
   for (const [name, param] of model.namedParameters()) {

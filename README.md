@@ -1,75 +1,82 @@
 # mini-gpt
 
-A small GPT-style transformer trained in **Node.js** with [`@mni-ml/framework`](https://www.npmjs.com/package/@mni-ml/framework) from npm, using Karpathy-style char-level modeling on Tiny Shakespeare by default, or BPE + larger corpora when you use the optional Python data scripts.
+A small GPT-style transformer in **Node.js**, trained with [`@mni-ml/framework`](https://www.npmjs.com/package/@mni-ml/framework) on **BPE-tokenized** text. You can build the dataset from **TinyStories** or **YouTube-Commons** transcripts using the included Python scripts; training and sampling run in JavaScript.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `src/train.js` | Train on `data/input.txt` (character-level tokenizer) |
-| `src/train_youtube.js` | Train on BPE data under `data/` (see below) |
-| `src/generate.js` | Sample from a saved checkpoint |
-| `src/bpe.js` | Load HuggingFace-style BPE JSON for inference / YouTube training |
-| `scripts/prepare.js` | Download Tiny Shakespeare into `data/input.txt` |
-| `scripts/prepare_youtube.py` / `scripts/prepare_tinystories.py` | Optional: HF datasets → `data/train.bin`, `data/val.bin`, `tokenizer.json`, `meta.json` |
-| `scripts/gpu_probe.js` | Debug CUDA / framework matmul (development helper) |
-| `out/` | Checkpoints and `model-final.json` (created when you train; not shipped in the repo) |
+| `src/train.js` | Train on `data/train.bin` / `data/val.bin` + `data/tokenizer.json` |
+| `src/generate.js` | Sample from a checkpoint |
+| `src/bpe.js` | HuggingFace-style BPE JSON loader (ByteLevel) |
+| `scripts/prepare_tinystories.py` | Download TinyStories, train BPE, write `data/*.bin` and metadata |
+| `scripts/prepare_youtube.py` | Download YouTube-Commons transcripts, same output layout |
+| `scripts/gpu_probe.js` | Optional CUDA / framework matmul check |
+| `out/` | Checkpoints and `model-final.json` (created when you train; ignored by git) |
 
 ## Prerequisites
 
-1. **Node.js** — the framework [requires](https://www.npmjs.com/package/@mni-ml/framework) **Node ≥ 22.18** (per its `engines` field). This repo uses `fetch` in `scripts/prepare.js` as well.
+- **Node.js** ≥ **22.18** (required by `@mni-ml/framework`).
+- **Python** 3.10+ with packages from `requirements-data.txt` (for dataset + tokenizer prep only).
 
-2. Dependencies — install with `npm install` (or `pnpm install`). **`@mni-ml/framework`** is pulled from the public npm registry; no local checkout is required.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements-data.txt
+```
 
-3. **Optional Python** (3.10+) for BPE dataset preparation only:
-
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install -r requirements-data.txt
-   ```
-
-## Quick start (Tiny Shakespeare, char-level)
+Install JS dependencies:
 
 ```bash
 npm install
-npm run download    # data/input.txt
-npm run train       # writes checkpoints under out/
-npm run generate    # loads out/model-final.json by default
 ```
 
-`generate` accepts optional args: `[checkpoint] [prompt] [numTokens] [temperature] [tokenizerPath]`.
+## Train on TinyStories
 
-Training honors env vars such as `MAX_ITERS`, `BATCH_SIZE`, `LR`, `N_LAYER`, `N_HEAD`, `N_EMBD`, `BLOCK_SIZE`, `CHECKPOINT_EVERY`, `MODEL_DIR`, `NO_RESUME=1`. See `src/train.js` for the full list.
-
-## BPE + larger data (optional)
-
-1. Prepare binary token files and metadata (example: YouTube-Commons transcripts):
-
-   ```bash
-   npm run prepare:youtube
-   # or: python3 scripts/prepare_youtube.py
-   ```
-
-   Or TinyStories:
+1. **Prepare data** (downloads stories, trains BPE, encodes to `data/train.bin`, `data/val.bin`, `data/meta.json`, `data/tokenizer.json`):
 
    ```bash
    npm run prepare:tinystories
    ```
 
-2. Train:
+   Tunables via environment variables (see `scripts/prepare_tinystories.py`): e.g. `NUM_STORIES`, `VOCAB_SIZE`, `DATA_DIR`.
+
+2. **Train**:
 
    ```bash
-   npm run train:youtube
+   npm run train
    ```
 
-3. Generate with the same tokenizer as training (pass path to `data/tokenizer.json` if needed):
+   Checkpoints go under `out/`; the last save is `out/model-final.json`.
+
+3. **Generate** (tokenizer path is stored in the checkpoint; override with the 5th arg if needed):
 
    ```bash
-   node src/generate.js out/model-final.json "\n" 300 0.8 data/tokenizer.json
+   npm run generate
    ```
+
+   ```bash
+   node src/generate.js out/model-final.json "<|endoftext|>" 400 0.9 data/tokenizer.json
+   ```
+
+## Train on YouTube-Commons
+
+1. **Prepare data** (transcripts from HuggingFace, then BPE + bins):
+
+   ```bash
+   npm run prepare:youtube
+   ```
+
+   Tunables: `NUM_TRANSCRIPTS`, `VOCAB_SIZE`, `DATA_DIR` (see `scripts/prepare_youtube.py`).
+
+2. **Train** and **generate** — same as above (`npm run train`, `npm run generate`).
+
+## Training options
+
+`src/train.js` reads hyperparameters from the environment, including:
+
+`MAX_ITERS`, `BATCH_SIZE`, `LR`, `N_LAYER`, `N_HEAD`, `N_EMBD`, `BLOCK_SIZE`, `CHECKPOINT_EVERY`, `MODEL_DIR`, `DATA_DIR`, `GRAD_ACCUM_STEPS`, `NO_RESUME=1`.
 
 ## Development
 
-- **`npm run probe:gpu`** — optional; exercises CUDA libraries and `@mni-ml/framework` matmul (expects `koffi` where used in `scripts/gpu_probe.js`).
-
+- **`npm run probe:gpu`** — optional CUDA / `@mni-ml/framework` check (`scripts/gpu_probe.js`).

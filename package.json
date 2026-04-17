@@ -5,9 +5,7 @@
     "node": ">=22.18.0"
   },
   "scripts": {
-    "download": "node scripts/prepare.js",
     "train": "node src/train.js",
-    "train:youtube": "node src/train_youtube.js",
     "generate": "node src/generate.js",
     "prepare:youtube": "python3 scripts/prepare_youtube.py",
     "prepare:tinystories": "python3 scripts/prepare_tinystories.py",

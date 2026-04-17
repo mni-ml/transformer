@@ -1,3 +1,11 @@
+/**
+ * Train MiniGPT on BPE-tokenized text (TinyStories or YouTube-Commons).
+ *
+ * Expects data from `npm run prepare:tinystories` or `npm run prepare:youtube`:
+ *   data/train.bin, data/val.bin  – Int32 token IDs
+ *   data/meta.json                – vocab_size, eot_token, …
+ *   data/tokenizer.json           – HuggingFace BPE (ByteLevel)
+ */
 import {
   Tensor, native,
   Module, Parameter,
@@ -9,6 +17,7 @@ import {
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -29,20 +38,21 @@ const CONFIG = {
   evalIters: 3,
   logInterval: 10,
   generateEvery: 500,
-  generateLen: 300,
+  generateLen: 200,
 
-  lr: 1e-3,
+  lr: 6e-4,
   beta1: 0.9,
-  beta2: 0.99,
-  weightDecay: 0.01,
+  beta2: 0.95,
+  weightDecay: 0.1,
   dropoutRate: 0.1,
 
   warmupSteps: 200,
-  minLr: 1e-4,
+  minLr: 6e-5,
   maxGradNorm: 1.0,
 
   checkpointEvery: 500,
   modelDir: process.env.MODEL_DIR || join(ROOT, 'out'),
+  dataDir: process.env.DATA_DIR || join(ROOT, 'data'),
 };
 
 for (const [key, envKey] of [
@@ -56,15 +66,13 @@ for (const [key, envKey] of [
 const NO_RESUME = process.env.NO_RESUME === '1';
 
 // ════════════════════════════════════════════════════════════════
-// Gradient Clipping (legacy, kept for generate.js compat)
+// Helpers
 // ════════════════════════════════════════════════════════════════
 
 function clipGradNorm(paramTensors, maxNorm) {
   const ids = paramTensors.map(t => t._id);
   const norm = native.gradNorm(ids);
-  if (norm > maxNorm) {
-    native.clipGradNorm(ids, maxNorm);
-  }
+  if (norm > maxNorm) native.clipGradNorm(ids, maxNorm);
   return norm;
 }
 
@@ -75,15 +83,9 @@ function gcKeepParams(params) {
     const g = native.getGrad(p.value._id);
     if (g !== null && g !== undefined) keepIds.push(g);
   }
-  for (const mask of _causalMaskCache.values()) {
-    keepIds.push(mask._id);
-  }
+  for (const mask of _causalMaskCache.values()) keepIds.push(mask._id);
   native.gcTensors(keepIds);
 }
-
-// ════════════════════════════════════════════════════════════════
-// Learning Rate Schedule (linear warmup + cosine decay)
-// ════════════════════════════════════════════════════════════════
 
 function getLR(step, warmup, total, maxLr, minLr) {
   if (step < warmup) return maxLr * (step + 1) / warmup;
@@ -92,59 +94,48 @@ function getLR(step, warmup, total, maxLr, minLr) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Data Loading
+// Data Loading (pre-tokenized binary)
 // ════════════════════════════════════════════════════════════════
 
-const FALLBACK_TEXT = `twinkle twinkle little star how i wonder what you are
-up above the world so high like a diamond in the sky
-twinkle twinkle little star how i wonder what you are
-the quick brown fox jumps over the lazy dog`.trim();
-
-function loadTrainingText() {
-  const dataPath = join(ROOT, 'data', 'input.txt');
-  if (existsSync(dataPath)) {
-    console.log(`  Loading data from ${dataPath}`);
-    return readFileSync(dataPath, 'utf-8');
-  }
-  console.log('  WARNING: data/input.txt not found — run "npm run download" first');
-  return FALLBACK_TEXT;
+function loadBinaryTokens(path) {
+  const buf = readFileSync(path);
+  const ab = new ArrayBuffer(buf.length);
+  new Uint8Array(ab).set(buf);
+  return new Int32Array(ab);
 }
 
 // ════════════════════════════════════════════════════════════════
 // Model Serialization
 // ════════════════════════════════════════════════════════════════
 
-function saveModel(model, tokenizer, path, { step = -1, optimizer = null, bestValLoss = Infinity } = {}) {
+function saveModel(model, tokPath, path, { step = -1, optimizer = null, bestValLoss = Infinity } = {}) {
   const namedParams = model.namedParameters();
   const params = {};
   for (const [name, param] of namedParams) {
     const data = param.value.toFloat32();
-    params[name] = {
-      shape: [...param.value.shape],
-      data: Array.from(data),
-    };
+    params[name] = { shape: [...param.value.shape], data: Array.from(data) };
   }
   const checkpoint = {
     config: model.config,
-    tokenizer: { stoi: tokenizer.stoi, itos: tokenizer.itos, vocabSize: tokenizer.vocabSize },
+    tokenizerPath: tokPath,
     parameters: params,
     step,
     bestValLoss,
   };
-  if (optimizer) {
-    checkpoint.optimizer = { t: optimizer.t };
-  }
+  // We only save the step counter here. The per-parameter Adam m/v buffers
+  // live inside the Rust native backend and can't be exported yet.
+  // On resume we intentionally reset t=0 so bias correction compensates
+  // for the fresh m/v, giving well-behaved updates from the first step.
+  if (optimizer) checkpoint.optimizer = { t: optimizer.t };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(checkpoint));
   const sizeMB = (Buffer.byteLength(JSON.stringify(checkpoint)) / 1024 / 1024).toFixed(1);
   console.log(`  Model saved to ${path} (${sizeMB} MB)`);
 }
 
-function loadModel(path) {
+function loadModel(path, tokenizerPath) {
   const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
-  const tokenizer = new CharTokenizer('');
-  Object.assign(tokenizer, checkpoint.tokenizer);
-
+  const tokenizer = new BPETokenizer(tokenizerPath);
   const model = new MiniGPT(tokenizer.vocabSize, checkpoint.config);
   const namedParams = model.namedParameters();
   for (const [name, param] of namedParams) {
@@ -157,8 +148,7 @@ function loadModel(path) {
   }
   console.log(`  Model loaded from ${path}`);
   return {
-    model,
-    tokenizer,
+    model, tokenizer,
     config: checkpoint.config,
     step: checkpoint.step ?? -1,
     optimizerState: checkpoint.optimizer ?? null,
@@ -179,51 +169,26 @@ function findLatestCheckpoint(dir) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Character-Level Tokenizer
-// ════════════════════════════════════════════════════════════════
-
-class CharTokenizer {
-  constructor(text) {
-    const chars = [...new Set(text)].sort();
-    this.vocabSize = chars.length;
-    this.stoi = Object.fromEntries(chars.map((c, i) => [c, i]));
-    this.itos = Object.fromEntries(chars.map((c, i) => [i, c]));
-  }
-  encode(text) { return [...text].map(ch => this.stoi[ch]); }
-  decode(indices) { return indices.map(i => this.itos[i]).join(''); }
-}
-
-// ════════════════════════════════════════════════════════════════
-// Layer Normalization (uses native fused kernel)
+// Model architecture (must match generate.js)
 // ════════════════════════════════════════════════════════════════
 
 class LayerNorm extends Module {
   constructor(dim) {
     super();
     this.dim = dim;
-    const gammaData = new Float32Array(dim).fill(1.0);
-    this.gamma = new Parameter(Tensor.fromFloat32(gammaData, [dim]).setRequiresGrad(true));
-    const betaData = new Float32Array(dim).fill(0.0);
-    this.beta = new Parameter(Tensor.fromFloat32(betaData, [dim]).setRequiresGrad(true));
+    this.gamma = new Parameter(Tensor.fromFloat32(new Float32Array(dim).fill(1.0), [dim]).setRequiresGrad(true));
+    this.beta = new Parameter(Tensor.fromFloat32(new Float32Array(dim).fill(0.0), [dim]).setRequiresGrad(true));
   }
-  forward(x) {
-    return layerNorm(x, this.gamma.value, this.beta.value, 1e-5);
-  }
+  forward(x) { return layerNorm(x, this.gamma.value, this.beta.value, 1e-5); }
 }
-
-// ════════════════════════════════════════════════════════════════
-// Causal Self-Attention (Multi-Head)
-// ════════════════════════════════════════════════════════════════
 
 const _causalMaskCache = new Map();
 function getCausalMask(size) {
   if (_causalMaskCache.has(size)) return _causalMaskCache.get(size);
   const storage = new Float32Array(size * size);
-  for (let i = 0; i < size; i++) {
-    for (let j = 0; j < size; j++) {
+  for (let i = 0; i < size; i++)
+    for (let j = 0; j < size; j++)
       storage[i * size + j] = j <= i ? 0.0 : -1e9;
-    }
-  }
   const mask = Tensor.fromFloat32(storage, [1, 1, size, size]);
   _causalMaskCache.set(size, mask);
   return mask;
@@ -241,30 +206,20 @@ class CausalSelfAttention extends Module {
     this.valueProj = new Linear(nEmbd, nEmbd);
     this.outProj = new Linear(nEmbd, nEmbd);
   }
-
   forward(x) {
     const [B, S, E] = x.shape;
     const { nHead, headDim, scale } = this;
-
     let q = this.queryProj.forward(x);
     let k = this.keyProj.forward(x);
     let v = this.valueProj.forward(x);
-
-    // [B, S, nHead, D] -> [B*nHead, S, D] for flash attention
     q = q.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
     k = k.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
-
     let out = flashAttention(q, k, v, scale, true);
     out = out.view(B, nHead, S, headDim).permute(0, 2, 1, 3).contiguous().view(B, S, E);
-
     return this.outProj.forward(out);
   }
 }
-
-// ════════════════════════════════════════════════════════════════
-// Feed-Forward Network (4x hidden expansion with GELU)
-// ════════════════════════════════════════════════════════════════
 
 class FeedForward extends Module {
   constructor(nEmbd, dropoutRate) {
@@ -281,10 +236,6 @@ class FeedForward extends Module {
   }
 }
 
-// ════════════════════════════════════════════════════════════════
-// Transformer Block (pre-norm with residual connections)
-// ════════════════════════════════════════════════════════════════
-
 class TransformerBlock extends Module {
   constructor(nEmbd, nHead, dropoutRate) {
     super();
@@ -300,62 +251,36 @@ class TransformerBlock extends Module {
   }
 }
 
-// ════════════════════════════════════════════════════════════════
-// MiniGPT Model (GPT-2 architecture)
-// ════════════════════════════════════════════════════════════════
-
 class MiniGPT extends Module {
   constructor(vocabSize, config) {
     super();
     const { nEmbd, nHead, nLayer, blockSize, dropoutRate = 0 } = config;
     this.config = config;
     this.vocabSize = vocabSize;
-
     this.tokenEmb = new Embedding(vocabSize, nEmbd);
     this.posEmb = new Embedding(blockSize, nEmbd);
-
-    for (let i = 0; i < nLayer; i++) {
-      this[`block${i}`] = new TransformerBlock(nEmbd, nHead, dropoutRate);
-    }
-
+    for (let i = 0; i < nLayer; i++) this[`block${i}`] = new TransformerBlock(nEmbd, nHead, dropoutRate);
     this.lnFinal = new LayerNorm(nEmbd);
     this.headBias = new Parameter(Tensor.zeros([vocabSize]).setRequiresGrad(true));
   }
-
   forward(indices) {
     const batch = indices.length;
     const seqLen = indices[0].length;
-
     let x = this.tokenEmb.forward(indices);
-
     const posIndices = [];
-    for (let b = 0; b < batch; b++) {
-      posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
-    }
+    for (let b = 0; b < batch; b++) posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
     x = x.add(this.posEmb.forward(posIndices));
-
-    for (let i = 0; i < this.config.nLayer; i++) {
-      x = this[`block${i}`].forward(x);
-    }
-
+    for (let i = 0; i < this.config.nLayer; i++) x = this[`block${i}`].forward(x);
     x = this.lnFinal.forward(x);
     const wT = this.tokenEmb.weight.value.permute(1, 0);
     return x.matmul(wT).add(this.headBias.value);
   }
-
   forwardGpu(inputsIntId, batch, seqLen) {
     let x = this.tokenEmb.forwardGpu(inputsIntId, batch, seqLen);
-
     const posIndices = [];
-    for (let b = 0; b < batch; b++) {
-      posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
-    }
+    for (let b = 0; b < batch; b++) posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
     x = x.add(this.posEmb.forward(posIndices));
-
-    for (let i = 0; i < this.config.nLayer; i++) {
-      x = this[`block${i}`].forward(x);
-    }
-
+    for (let i = 0; i < this.config.nLayer; i++) x = this[`block${i}`].forward(x);
     x = this.lnFinal.forward(x);
     const wT = this.tokenEmb.weight.value.permute(1, 0);
     return x.matmul(wT).add(this.headBias.value);
@@ -363,7 +288,7 @@ class MiniGPT extends Module {
 }
 
 // ════════════════════════════════════════════════════════════════
-// Utilities
+// Batch helpers
 // ════════════════════════════════════════════════════════════════
 
 function getBatch(data, blockSize, batchSize) {
@@ -371,13 +296,13 @@ function getBatch(data, blockSize, batchSize) {
   const targets = [];
   for (let i = 0; i < batchSize; i++) {
     const start = Math.floor(Math.random() * (data.length - blockSize - 1));
-    inputs.push(data.slice(start, start + blockSize));
-    targets.push(data.slice(start + 1, start + blockSize + 1));
+    inputs.push(Array.from(data.slice(start, start + blockSize)));
+    targets.push(Array.from(data.slice(start + 1, start + blockSize + 1)));
   }
   return { inputs, targets };
 }
 
-function estimateLoss(model, tokenizer, trainData, valData, config, params) {
+function estimateLoss(model, trainData, valData, config, params) {
   model.eval();
   native.noGradStart();
   const losses = { train: 0, val: 0 };
@@ -397,39 +322,70 @@ function estimateLoss(model, tokenizer, trainData, valData, config, params) {
   return losses;
 }
 
+const GENERATION_PROMPTS = [
+  "Once upon a time",
+  "There was a little girl named",
+  "One day, a boy named Tom",
+  "The sun was shining and",
+  "Lily and her mom went to the",
+  "Once there was a big bear who",
+];
+
 function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params = null) {
   model.eval();
   native.noGradStart();
-  let context = tokenizer.encode(prompt);
+
+  let context;
+  if (typeof prompt === 'string') {
+    context = tokenizer.encode(prompt);
+  } else if (Array.isArray(prompt) && prompt.length > 0) {
+    context = [...prompt];
+  } else {
+    const pick = GENERATION_PROMPTS[Math.floor(Math.random() * GENERATION_PROMPTS.length)];
+    context = tokenizer.encode(pick);
+  }
   const blockSize = model.config.blockSize;
+  const eot = tokenizer.eotToken;
+  const promptLen = context.length;
 
   for (let i = 0; i < maxTokens; i++) {
     const ctxWindow = context.slice(-blockSize);
     const logits = model.forward([ctxWindow]);
 
     const seqLen = ctxWindow.length;
-    const vocabSize = tokenizer.vocabSize;
+    const vocabSize = model.vocabSize;
     const lastLogitsData = logits.toFloat32();
     const offset = (seqLen - 1) * vocabSize;
     const lastLogits = [];
-    for (let v = 0; v < vocabSize; v++) {
-      lastLogits.push(lastLogitsData[offset + v] / temperature);
-    }
+    for (let v = 0; v < vocabSize; v++) lastLogits.push(lastLogitsData[offset + v] / temperature);
 
+    // Suppress EOT for the first 40 generated tokens so the model
+    // is forced to produce real text even when undertrained.
+    if (i < 40 && eot >= 0) lastLogits[eot] = -Infinity;
+
+    // Numerically stable softmax: subtract max, exponentiate, normalize.
     const maxLogit = Math.max(...lastLogits);
     const exps = lastLogits.map(l => Math.exp(l - maxLogit));
     const sumExps = exps.reduce((a, b) => a + b);
-    const probs = exps.map(e => e / sumExps);
 
-    const r = Math.random();
-    let cumSum = 0;
-    let nextToken = 0;
-    for (let v = 0; v < vocabSize; v++) {
-      cumSum += probs[v];
-      if (r < cumSum) { nextToken = v; break; }
+    let nextToken;
+    if (sumExps === 0 || !isFinite(sumExps)) {
+      // All probs underflowed — pick a random non-EOT token.
+      do { nextToken = Math.floor(Math.random() * vocabSize); }
+      while (nextToken === eot);
+    } else {
+      const probs = exps.map(e => e / sumExps);
+      const r = Math.random();
+      let cumSum = 0;
+      nextToken = vocabSize - 1; // fallback to last token, never 0 (EOT)
+      for (let v = 0; v < vocabSize; v++) {
+        cumSum += probs[v];
+        if (r < cumSum) { nextToken = v; break; }
+      }
     }
 
     context.push(nextToken);
+    if (nextToken === eot && i >= 40) break;
     if (params) gcKeepParams(params);
   }
 
@@ -439,15 +395,26 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params
 }
 
 // ════════════════════════════════════════════════════════════════
-// Training
+// Main
 // ════════════════════════════════════════════════════════════════
 
 function main() {
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
-  console.log('  MiniGPT — Rust+CUDA Native Backend');
+  console.log('  MiniGPT (BPE)');
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
+
+  const tokenizerPath = join(CONFIG.dataDir, 'tokenizer.json');
+  const metaPath = join(CONFIG.dataDir, 'meta.json');
+
+  if (!existsSync(metaPath)) {
+    console.error('  ERROR: data/meta.json not found — run npm run prepare:tinystories or npm run prepare:youtube first');
+    process.exit(1);
+  }
+
+  const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+  const vocabSize = meta.vocab_size;
 
   let model, tokenizer, startStep = 0;
   let savedOptimizerState = null;
@@ -456,7 +423,7 @@ function main() {
   const latest = NO_RESUME ? null : findLatestCheckpoint(CONFIG.modelDir);
   if (latest) {
     console.log(`  Resuming from checkpoint at step ${latest.step}`);
-    const loaded = loadModel(latest.path);
+    const loaded = loadModel(latest.path, tokenizerPath);
     model = loaded.model;
     tokenizer = loaded.tokenizer;
     startStep = latest.step;
@@ -466,22 +433,21 @@ function main() {
     console.log('');
   }
 
-  const text = loadTrainingText();
-  if (!tokenizer) tokenizer = new CharTokenizer(text);
-  const allData = tokenizer.encode(text);
+  if (!tokenizer) tokenizer = new BPETokenizer(tokenizerPath);
 
-  const splitIdx = Math.floor(allData.length * 0.9);
-  const trainData = allData.slice(0, splitIdx);
-  const valData = allData.slice(splitIdx);
+  // ── Load pre-tokenized binary data ──
+  console.log('  Loading pre-tokenized data...');
+  const trainData = loadBinaryTokens(join(CONFIG.dataDir, 'train.bin'));
+  const valData = loadBinaryTokens(join(CONFIG.dataDir, 'val.bin'));
 
-  console.log(`  Vocabulary:     ${tokenizer.vocabSize} unique characters`);
-  console.log(`  Training data:  ${trainData.length.toLocaleString()} tokens (${(trainData.length / 1024).toFixed(1)} KB)`);
+  console.log(`  Vocabulary:     ${vocabSize} BPE tokens`);
+  console.log(`  Training data:  ${trainData.length.toLocaleString()} tokens (${(trainData.length * 4 / 1024 / 1024).toFixed(1)} MB)`);
   console.log(`  Validation:     ${valData.length.toLocaleString()} tokens`);
   console.log(`  Architecture:   ${CONFIG.nLayer} blocks, ${CONFIG.nHead} heads, ${CONFIG.nEmbd}-dim`);
   console.log(`  Context window: ${CONFIG.blockSize} tokens`);
   console.log(`  Dropout:        ${CONFIG.dropoutRate}`);
 
-  if (!model) model = new MiniGPT(tokenizer.vocabSize, CONFIG);
+  if (!model) model = new MiniGPT(vocabSize, CONFIG);
   const params = model.parameters();
   const totalParams = params.reduce((sum, p) => sum + p.value.size, 0);
   console.log(`  Parameters:     ${totalParams.toLocaleString()}`);
@@ -503,14 +469,16 @@ function main() {
     weightDecay: CONFIG.weightDecay,
   });
   if (savedOptimizerState) {
-    optimizer.t = savedOptimizerState.t;
-    console.log(`  Optimizer state restored (t=${optimizer.t})`);
+    // Adam m/v buffers can't be restored from checkpoint (they live in Rust).
+    // Keeping t=0 lets bias correction compensate for fresh m/v, avoiding
+    // the instability that comes from t=N with m=0,v=0.
+    console.log(`  Optimizer restarting fresh (checkpoint had t=${savedOptimizerState.t}, reset to 0 for stability)`);
   }
 
   const paramTensors = params.map(p => p.value);
 
-  // Upload tokenized data to GPU (zero-copy batch sampling)
-  const trainDatasetId = native.createDataset(new Int32Array(trainData));
+  // Upload tokenized data to GPU
+  const trainDatasetId = native.createDataset(new Int32Array(trainData.buffer, trainData.byteOffset, trainData.length));
   console.log(`  GPU dataset uploaded: ${trainData.length.toLocaleString()} tokens`);
 
   const startTime = Date.now();
@@ -518,7 +486,6 @@ function main() {
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
     const stepStart = Date.now();
     optimizer.lr = getLR(iter, CONFIG.warmupSteps, CONFIG.maxIters, CONFIG.lr, CONFIG.minLr);
-
     optimizer.zeroGrad();
     let accumLoss = 0;
     const shouldLog = (iter === startStep) || (iter % CONFIG.logInterval === 0) || (iter % CONFIG.evalInterval === 0);
@@ -554,7 +521,7 @@ function main() {
         ` ${(stepMs / 1000).toFixed(1)}s/step │` +
         ` ${elapsed}s │ evaluating...`
       );
-      const losses = estimateLoss(model, tokenizer, trainData, valData, CONFIG, params);
+      const losses = estimateLoss(model, trainData, valData, CONFIG, params);
       const marker = losses.val < bestValLoss ? ' *' : '';
       if (losses.val < bestValLoss) bestValLoss = losses.val;
       const avgStepMs = (Date.now() - startTime) / stepsCompleted;
@@ -580,10 +547,11 @@ function main() {
     }
 
     if (iter > 0 && iter % CONFIG.generateEvery === 0) {
-      const sample = generate(model, tokenizer, '\n', CONFIG.generateLen, 0.8, params);
+      const sample = generate(model, tokenizer, null, CONFIG.generateLen, 0.8, params);
       console.log('');
       console.log('  ── sample ──────────────────────────────────────────');
-      for (const line of sample.split('\n').slice(0, 6)) {
+      const cleaned = sample.replaceAll('<|endoftext|>', '').trim();
+      for (const line of cleaned.split('\n').slice(0, 8)) {
         console.log(`  ${line}`);
       }
       console.log('  ───────────────────────────────────────────────────');
@@ -591,7 +559,7 @@ function main() {
     }
 
     if (iter > 0 && iter % CONFIG.checkpointEvery === 0) {
-      saveModel(model, tokenizer, join(CONFIG.modelDir, `checkpoint-${iter}.json`), { step: iter, optimizer, bestValLoss });
+      saveModel(model, tokenizerPath, join(CONFIG.modelDir, `checkpoint-${iter}.json`), { step: iter, optimizer, bestValLoss });
     }
   }
 
@@ -600,11 +568,12 @@ function main() {
   console.log('  Final Generation (temperature=0.8)');
   console.log('─────────────────────────────────────────────────────────');
   console.log('');
-  const finalText = generate(model, tokenizer, '\n', CONFIG.generateLen * 2, 0.8, params);
-  for (const line of finalText.split('\n').slice(0, 12)) {
+  const finalText = generate(model, tokenizer, null, CONFIG.generateLen * 2, 0.8, params);
+  const finalCleaned = finalText.replaceAll('<|endoftext|>', '').trim();
+  for (const line of finalCleaned.split('\n').slice(0, 12)) {
     console.log(`  ${line}`);
   }
-  saveModel(model, tokenizer, join(CONFIG.modelDir, 'model-final.json'), { step: CONFIG.maxIters, optimizer, bestValLoss });
+  saveModel(model, tokenizerPath, join(CONFIG.modelDir, 'model-final.json'), { step: CONFIG.maxIters, optimizer, bestValLoss });
 
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
