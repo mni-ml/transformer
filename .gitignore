@@ -14,9 +14,11 @@ npm-debug.log*
 # Optional local framework monorepo checkout (not used when installing from npm)
 framework/
 
-# Training / inference outputs (keep directory only)
-out/
+# Training / inference outputs (track default checkpoint + tokenizer; ignore other checkpoints)
+out/*
 !out/.gitkeep
+!out/model-final.json
+!out/tokenizer.json
 
 # Large pretokenized data (from Python prep scripts)
 data/*.bin
