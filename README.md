@@ -14,7 +14,7 @@ A small GPT-style transformer in **Node.js**, trained with [`@mni-ml/framework`]
 | `scripts/prepare_tinystories.py` | Download TinyStories, train BPE, write `data/*.bin` and metadata |
 | `scripts/prepare_youtube.py` | Download YouTube-Commons transcripts, same output layout |
 | `scripts/gpu_probe.js` | Optional CUDA / framework matmul check |
-| `out/` | Checkpoints and `model-final.json` (created when you train; ignored by git) |
+| `out/` | `model-final.json` and `tokenizer.json` are committed as defaults; other checkpoints stay local (gitignored) |
 
 ## Prerequisites
 
