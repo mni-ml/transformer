@@ -2,16 +2,17 @@
 Download YouTube-Commons transcripts from HuggingFace, train a BPE tokenizer,
 and save pre-tokenized binary data for training.
 
-Runs as part of the Modal image build (or locally with: python prepare_youtube.py).
+Run from the repo root: python3 scripts/prepare_youtube.py
 
-Requirements: pip install datasets tokenizers
+Requirements: pip install -r requirements-data.txt (or datasets tokenizers huggingface_hub pyarrow)
 """
 import os
-import sys
 import json
 import array
 
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_SCRIPT_DIR)
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_ROOT, "data"))
 NUM_TRANSCRIPTS = int(os.environ.get("NUM_TRANSCRIPTS", "10000"))
 VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", "4096"))
 

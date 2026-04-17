@@ -2,9 +2,9 @@
  * Load a saved MiniGPT checkpoint and generate text.
  *
  * Usage:
- *   node generate.js                          # uses out/model-final.json
- *   node generate.js out/checkpoint-1000.json  # specific checkpoint
- *   node generate.js out/model-final.json "ROMEO:" 300 0.8
+ *   npm run generate                          # uses out/model-final.json
+ *   node src/generate.js out/checkpoint-1000.json
+ *   node src/generate.js out/model-final.json "ROMEO:" 300 0.8
  */
 import {
   Tensor, native,
@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
 
 // ── Model architecture (must match train.js) ────────────────
 
@@ -221,7 +222,7 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8) {
 // ── Main ────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
-const modelPath = args[0] || join(__dirname, 'out', 'model-final.json');
+const modelPath = args[0] || join(ROOT, 'out', 'model-final.json');
 const prompt = args[1] || '\n';
 const numTokens = parseInt(args[2] || '300');
 const temperature = parseFloat(args[3] || '0.8');
@@ -229,7 +230,7 @@ const tokenizerPath = args[4] || null;
 
 if (!existsSync(modelPath)) {
   console.error(`Model not found: ${modelPath}`);
-  console.error('Train a model first with: node train.js');
+  console.error('Train a model first with: npm run train');
   process.exit(1);
 }
 

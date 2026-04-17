@@ -1,7 +1,7 @@
 /**
  * Train MiniGPT on YouTube-Commons transcripts using a BPE tokenizer.
  *
- * Expects pre-tokenized binary data produced by prepare_youtube.py:
+ * Expects pre-tokenized binary data produced by scripts/prepare_youtube.py:
  *   data/train.bin   – Int32 token IDs
  *   data/val.bin     – Int32 token IDs
  *   data/meta.json   – { vocab_size, eot_token, … }
@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
 
 // ════════════════════════════════════════════════════════════════
 // Configuration
@@ -51,8 +52,8 @@ const CONFIG = {
   maxGradNorm: 1.0,
 
   checkpointEvery: 500,
-  modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
-  dataDir: process.env.DATA_DIR || join(__dirname, 'data'),
+  modelDir: process.env.MODEL_DIR || join(ROOT, 'out'),
+  dataDir: process.env.DATA_DIR || join(ROOT, 'data'),
 };
 
 for (const [key, envKey] of [
@@ -409,7 +410,7 @@ function main() {
   const metaPath = join(CONFIG.dataDir, 'meta.json');
 
   if (!existsSync(metaPath)) {
-    console.error('  ERROR: data/meta.json not found — run prepare_youtube.py first');
+    console.error('  ERROR: data/meta.json not found — run: python3 scripts/prepare_youtube.py');
     process.exit(1);
   }
 

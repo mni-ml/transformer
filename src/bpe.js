@@ -2,7 +2,7 @@
  * BPE tokenizer for Node.js — loads a HuggingFace tokenizers JSON file
  * (trained with ByteLevel pre-tokenizer) and provides encode / decode.
  *
- * Compatible with the output of prepare_youtube.py.
+ * Compatible with the output of scripts/prepare_youtube.py (and similar HF BPE exports).
  */
 import { readFileSync } from 'node:fs';
 

@@ -12,4 +12,15 @@ npm-debug.log*
 
 framework/
 
-!out/model-final.json
+# Training / inference outputs (keep directory only)
+out/
+!out/.gitkeep
+
+# Large pretokenized data (from Python prep scripts)
+data/*.bin
+
+# Python
+.venv*/
+.venv-*/
+__pycache__/
+*.py[cod]

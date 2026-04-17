@@ -2,9 +2,13 @@
   "name": "mini-gpt",
   "type": "module",
   "scripts": {
-    "download": "node prepare.js",
-    "train": "node train.js",
-    "generate": "node generate.js"
+    "download": "node scripts/prepare.js",
+    "train": "node src/train.js",
+    "train:youtube": "node src/train_youtube.js",
+    "generate": "node src/generate.js",
+    "prepare:youtube": "python3 scripts/prepare_youtube.py",
+    "prepare:tinystories": "python3 scripts/prepare_tinystories.py",
+    "probe:gpu": "node scripts/gpu_probe.js"
   },
   "dependencies": {
     "@mni-ml/framework": "file:framework/packages/framework"

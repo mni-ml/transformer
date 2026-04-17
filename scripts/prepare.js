@@ -3,7 +3,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, 'data');
+const ROOT = join(__dirname, '..');
+const DATA_DIR = join(ROOT, 'data');
 const OUTPUT = join(DATA_DIR, 'input.txt');
 const URL = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt';
 

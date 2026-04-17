@@ -1,0 +1,5 @@
+# Optional: BPE dataset prep (YouTube-Commons, TinyStories) → data/*.bin
+datasets>=2.14.0
+tokenizers>=0.15.0
+huggingface_hub>=0.20.0
+pyarrow>=14.0.0

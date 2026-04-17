@@ -11,6 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
 
 // ════════════════════════════════════════════════════════════════
 // Configuration
@@ -41,7 +42,7 @@ const CONFIG = {
   maxGradNorm: 1.0,
 
   checkpointEvery: 500,
-  modelDir: process.env.MODEL_DIR || join(__dirname, 'out'),
+  modelDir: process.env.MODEL_DIR || join(ROOT, 'out'),
 };
 
 for (const [key, envKey] of [
@@ -100,12 +101,12 @@ twinkle twinkle little star how i wonder what you are
 the quick brown fox jumps over the lazy dog`.trim();
 
 function loadTrainingText() {
-  const dataPath = join(__dirname, 'data', 'input.txt');
+  const dataPath = join(ROOT, 'data', 'input.txt');
   if (existsSync(dataPath)) {
     console.log(`  Loading data from ${dataPath}`);
     return readFileSync(dataPath, 'utf-8');
   }
-  console.log('  WARNING: data/input.txt not found — run "node prepare.js" first');
+  console.log('  WARNING: data/input.txt not found — run "npm run download" first');
   return FALLBACK_TEXT;
 }
 
