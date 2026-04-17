@@ -1,6 +1,9 @@
 {
   "name": "mini-gpt",
   "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "download": "node scripts/prepare.js",
     "train": "node src/train.js",
@@ -11,6 +14,6 @@
     "probe:gpu": "node scripts/gpu_probe.js"
   },
   "dependencies": {
-    "@mni-ml/framework": "file:framework/packages/framework"
+    "@mni-ml/framework": "^0.3.4"
   }
 }

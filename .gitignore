@@ -10,6 +10,7 @@ npm-debug.log*
 
 *.tgz
 
+# Optional local framework monorepo checkout (not used when installing from npm)
 framework/
 
 # Training / inference outputs (keep directory only)

@@ -1,6 +1,6 @@
 # mini-gpt
 
-A small GPT-style transformer trained in **Node.js** with `@mni-ml/framework` (installed from a local path; see below), using Karpathy-style char-level modeling on Tiny Shakespeare by default, or BPE + larger corpora when you use the optional Python data scripts.
+A small GPT-style transformer trained in **Node.js** with [`@mni-ml/framework`](https://www.npmjs.com/package/@mni-ml/framework) from npm, using Karpathy-style char-level modeling on Tiny Shakespeare by default, or BPE + larger corpora when you use the optional Python data scripts.
 
 ## Layout
 
@@ -17,15 +17,9 @@ A small GPT-style transformer trained in **Node.js** with `@mni-ml/framework` (i
 
 ## Prerequisites
 
-1. **Node.js** (18+ recommended; uses `fetch` in `scripts/prepare.js`).
+1. **Node.js** — the framework [requires](https://www.npmjs.com/package/@mni-ml/framework) **Node ≥ 22.18** (per its `engines` field). This repo uses `fetch` in `scripts/prepare.js` as well.
 
-2. **`@mni-ml/framework`** is declared as a **local file dependency**:
-
-   ```text
-   framework/packages/framework
-   ```
-
-   Clone or symlink your copy of the framework into `framework/` at the repo root so `npm install` can resolve it. If this path does not exist, installs will fail until you add it.
+2. Dependencies — install with `npm install` (or `pnpm install`). **`@mni-ml/framework`** is pulled from the public npm registry; no local checkout is required.
 
 3. **Optional Python** (3.10+) for BPE dataset preparation only:
 
