@@ -1,19 +1,19 @@
 /**
- * CPU training path (works with the default @mni-ml/framework npm build).
- * For GPU dataset batching + forwardGpu + crossEntropyLossGpu, use `npm run train:gpu`.
+ * GPU training path for MiniGPT (BPE). Uses native dataset batching, GPU embedding
+ * lookup, and crossEntropyLossGpu when the CUDA/WebGPU optional native build is installed.
  *
- * Train MiniGPT on BPE-tokenized text (TinyStories or YouTube-Commons).
+ * Requires: native.createDataset, sampleBatch, embeddingForwardGpu, crossEntropyLossGpu,
+ * freeIntBuffer (from the platform-specific @mni-ml/framework-* optional dependency).
  *
- * Expects data from `npm run prepare:tinystories` or `npm run prepare:youtube`:
- *   data/train.bin, data/val.bin  – Int32 token IDs
- *   data/meta.json                – vocab_size, eot_token, …
- *   data/tokenizer.json           – HuggingFace BPE (ByteLevel)
+ * For the default npm CPU build, use `npm run train` (src/train.js).
+ *
+ * Data layout matches `npm run prepare:tinystories` / `prepare:youtube`.
  */
 import {
   Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, crossEntropyLoss,
+  softmax, crossEntropyLoss, crossEntropyLossGpu,
   gelu, dropout, layerNorm, flashAttention,
   Adam,
 } from '@mni-ml/framework';
@@ -24,6 +24,19 @@ import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
+
+function assertGpuTrainingOps() {
+  const required = ['createDataset', 'sampleBatch', 'embeddingForwardGpu', 'crossEntropyLossGpu', 'freeIntBuffer'];
+  const missing = required.filter((k) => typeof native[k] !== 'function');
+  if (missing.length) {
+    console.error('');
+    console.error('  GPU training is unavailable: missing native bindings:', missing.join(', '));
+    console.error('  Install the matching @mni-ml/framework platform package (e.g. CUDA) so these');
+    console.error('  symbols are exported, or use CPU training: npm run train');
+    console.error('');
+    process.exit(1);
+  }
+}
 
 // ════════════════════════════════════════════════════════════════
 // Configuration
@@ -280,6 +293,16 @@ class MiniGPT extends Module {
     const wT = this.tokenEmb.weight.value.permute(1, 0);
     return x.matmul(wT).add(this.headBias.value);
   }
+  forwardGpu(inputsIntId, batch, seqLen) {
+    let x = this.tokenEmb.forwardGpu(inputsIntId, batch, seqLen);
+    const posIndices = [];
+    for (let b = 0; b < batch; b++) posIndices.push(Array.from({ length: seqLen }, (_, i) => i));
+    x = x.add(this.posEmb.forward(posIndices));
+    for (let i = 0; i < this.config.nLayer; i++) x = this[`block${i}`].forward(x);
+    x = this.lnFinal.forward(x);
+    const wT = this.tokenEmb.weight.value.permute(1, 0);
+    return x.matmul(wT).add(this.headBias.value);
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -394,9 +417,11 @@ function generate(model, tokenizer, prompt, maxTokens, temperature = 0.8, params
 // ════════════════════════════════════════════════════════════════
 
 function main() {
+  assertGpuTrainingOps();
+
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
-  console.log('  12M Parameter LLM');
+  console.log('  MiniGPT — GPU training');
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
 
@@ -472,6 +497,10 @@ function main() {
 
   const paramTensors = params.map(p => p.value);
 
+  const trainDatasetId = native.createDataset(new Int32Array(trainData.buffer, trainData.byteOffset, trainData.length));
+  console.log(`  GPU dataset handle: ${trainData.length.toLocaleString()} tokens`);
+  console.log('');
+
   const startTime = Date.now();
 
   for (let iter = startStep; iter < CONFIG.maxIters; iter++) {
@@ -482,9 +511,9 @@ function main() {
     const shouldLog = (iter === startStep) || (iter % CONFIG.logInterval === 0) || (iter % CONFIG.evalInterval === 0);
 
     for (let microStep = 0; microStep < CONFIG.gradAccumSteps; microStep++) {
-      const { inputs, targets } = getBatch(trainData, CONFIG.blockSize, CONFIG.batchSize);
-      const logits = model.forward(inputs);
-      const loss = crossEntropyLoss(logits, targets);
+      const [inputsId, targetsId] = native.sampleBatch(trainDatasetId, CONFIG.blockSize, CONFIG.batchSize);
+      const logits = model.forwardGpu(inputsId, CONFIG.batchSize, CONFIG.blockSize);
+      const loss = crossEntropyLossGpu(logits, targetsId);
       const scaledLoss = loss.mul(1 / CONFIG.gradAccumSteps);
       scaledLoss.backward();
       if (shouldLog) accumLoss += loss.item();
@@ -493,6 +522,8 @@ function main() {
         console.log(`  [first micro-batch done: ${((Date.now() - stepStart) / 1000).toFixed(1)}s, loss=${accumLoss.toFixed(4)}]`);
       }
       gcKeepParams(params);
+      native.freeIntBuffer(inputsId);
+      native.freeIntBuffer(targetsId);
     }
     if (shouldLog) accumLoss /= CONFIG.gradAccumSteps;
 

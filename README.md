@@ -6,8 +6,10 @@ A small GPT-style transformer in **Node.js**, trained with [`@mni-ml/framework`]
 
 | Path | Role |
 |------|------|
-| `src/train.js` | Train on `data/train.bin` / `data/val.bin` + `data/tokenizer.json` |
-| `src/generate.js` | Sample from a checkpoint |
+| `src/train.js` | **CPU** training (default npm native build; matmul attention fallback) |
+| `src/train_gpu.js` | **GPU** training (`createDataset` / `forwardGpu` / `crossEntropyLossGpu`; needs platform CUDA/WebGPU optional package) |
+| `src/generate.js` | **CPU-friendly** sampling (works everywhere) |
+| `src/generate_gpu.js` | **GPU** sampling (`native.flashAttention` required) |
 | `src/bpe.js` | HuggingFace-style BPE JSON loader (ByteLevel) |
 | `scripts/prepare_tinystories.py` | Download TinyStories, train BPE, write `data/*.bin` and metadata |
 | `scripts/prepare_youtube.py` | Download YouTube-Commons transcripts, same output layout |
@@ -41,10 +43,16 @@ npm install
 
    Tunables via environment variables (see `scripts/prepare_tinystories.py`): e.g. `NUM_STORIES`, `VOCAB_SIZE`, `DATA_DIR`.
 
-2. **Train**:
+2. **Train** (CPU or GPU):
 
    ```bash
    npm run train
+   ```
+
+   If you have installed the matching **`@mni-ml/framework-*`** optional native package (e.g. CUDA) so GPU symbols exist:
+
+   ```bash
+   npm run train:gpu
    ```
 
    Checkpoints go under `out/`; the last save is `out/model-final.json`.
@@ -53,6 +61,12 @@ npm install
 
    ```bash
    npm run generate
+   ```
+
+   With a GPU-capable native build and `native.flashAttention`:
+
+   ```bash
+   npm run generate:gpu
    ```
 
    ```bash
@@ -73,7 +87,7 @@ npm install
 
 ## Training options
 
-`src/train.js` reads hyperparameters from the environment, including:
+`src/train.js` and `src/train_gpu.js` read the same hyperparameters from the environment, including:
 
 `MAX_ITERS`, `BATCH_SIZE`, `LR`, `N_LAYER`, `N_HEAD`, `N_EMBD`, `BLOCK_SIZE`, `CHECKPOINT_EVERY`, `MODEL_DIR`, `DATA_DIR`, `GRAD_ACCUM_STEPS`, `NO_RESUME=1`.
 

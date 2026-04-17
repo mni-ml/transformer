@@ -1,19 +1,16 @@
 /**
- * CPU-compatible generation (matmul attention fallback if flashAttention is unavailable).
- * For sampling that requires native.flashAttention, use `npm run generate:gpu`.
- *
- * Load a saved MiniGPT (BPE) checkpoint and generate text.
+ * GPU-oriented generation: requires native.flashAttention (CUDA/WebGPU optional native build).
+ * If this exits, use `npm run generate` for the CPU-friendly script.
  *
  * Usage:
- *   npm run generate
- *   node src/generate.js out/checkpoint-1000.json
- *   node src/generate.js out/model-final.json "<|endoftext|>" 300 0.8 data/tokenizer.json
+ *   npm run generate:gpu
+ *   node src/generate_gpu.js out/model-final.json "<|endoftext|>" 300 0.8 data/tokenizer.json
  */
 import {
   Tensor, native,
   Module, Parameter,
   Linear, Embedding,
-  softmax, gelu, layerNorm, flashAttention,
+  gelu, layerNorm, flashAttention,
 } from '@mni-ml/framework';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -22,6 +19,17 @@ import { BPETokenizer } from './bpe.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
+
+function assertGpuFlashAttention() {
+  if (typeof native.flashAttention !== 'function') {
+    console.error('');
+    console.error('  generate:gpu requires native.flashAttention (install the CUDA/WebGPU');
+    console.error('  @mni-ml/framework optional native package for your platform).');
+    console.error('  Use: npm run generate');
+    console.error('');
+    process.exit(1);
+  }
+}
 
 // ── Model architecture (must match src/train.js) ───────────
 
@@ -37,18 +45,6 @@ class LayerNorm extends Module {
   forward(x) {
     return layerNorm(x, this.gamma.value, this.beta.value, 1e-5);
   }
-}
-
-const _causalMaskCache = new Map();
-function getCausalMask(size) {
-  if (_causalMaskCache.has(size)) return _causalMaskCache.get(size);
-  const storage = new Float32Array(size * size);
-  for (let i = 0; i < size; i++)
-    for (let j = 0; j < size; j++)
-      storage[i * size + j] = j <= i ? 0.0 : -1e9;
-  const mask = Tensor.fromFloat32(storage, [1, 1, size, size]);
-  _causalMaskCache.set(size, mask);
-  return mask;
 }
 
 class CausalSelfAttention extends Module {
@@ -74,17 +70,7 @@ class CausalSelfAttention extends Module {
     k = k.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
     v = v.view(B, S, nHead, headDim).permute(0, 2, 1, 3).contiguous().view(B * nHead, S, headDim);
 
-    let out;
-    if (typeof native.flashAttention === 'function') {
-      out = flashAttention(q, k, v, scale, true);
-    } else {
-      // CPU/native fallback when flashAttention kernel is unavailable.
-      let scores = q.matmul(k.permute(0, 2, 1)).mul(scale); // [B*H, S, S]
-      const mask = getCausalMask(S).view(S, S); // [S, S]
-      scores = scores.add(mask);
-      const probs = softmax(scores, -1);
-      out = probs.matmul(v);
-    }
+    const out = flashAttention(q, k, v, scale, true);
     out = out.view(B, nHead, S, headDim).permute(0, 2, 1, 3).contiguous().view(B, S, E);
     return this.outProj.forward(out);
   }
@@ -225,9 +211,11 @@ const numTokens = parseInt(args[2] || '300');
 const temperature = parseFloat(args[3] || '0.8');
 const tokenizerPath = args[4] || null;
 
+assertGpuFlashAttention();
+
 if (!existsSync(modelPath)) {
   console.error(`Model not found: ${modelPath}`);
-  console.error('Train a model first with: npm run train');
+  console.error('Train a model first with: npm run train or npm run train:gpu');
   process.exit(1);
 }
 

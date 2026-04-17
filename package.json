@@ -6,7 +6,9 @@
   },
   "scripts": {
     "train": "node src/train.js",
+    "train:gpu": "node src/train_gpu.js",
     "generate": "node src/generate.js",
+    "generate:gpu": "node src/generate_gpu.js",
     "prepare:youtube": "python3 scripts/prepare_youtube.py",
     "prepare:tinystories": "python3 scripts/prepare_tinystories.py",
     "probe:gpu": "node scripts/gpu_probe.js"
