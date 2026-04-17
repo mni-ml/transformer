@@ -1,6 +1,7 @@
-# mini-gpt
+# mni-ml/transformer
 
-A small GPT-style transformer in **Node.js**, trained with [`@mni-ml/framework`](https://www.npmjs.com/package/@mni-ml/framework) on **BPE-tokenized** text. You can build the dataset from **TinyStories** or **YouTube-Commons** transcripts using the included Python scripts; training and sampling run in JavaScript.
+A 12M paramater LLM in **Node.js**, trained with [`@mni-ml/framework`](https://www.npmjs.com/package/@mni-ml/framework) on **BPE-tokenized** text. You can build the dataset from **TinyStories** or **YouTube-Commons** transcripts using the included Python scripts; training and sampling run in JavaScript.
+<img width="2132" height="1200" alt="Logo" src="https://github.com/user-attachments/assets/053142ce-810c-4cf1-8335-b96efc676b14" />
 
 ## Layout
 
