@@ -1,28 +1,20 @@
 """
-Speculative-decoding demo on Modal.
+Run benchmark_speculative.js on Modal so we get real A100 numbers
+(local CPU has no flashAttention kernel and is unrealistically slow).
 
 Mounts:
   - mini-gpt-tinystories-v4-vol         → /app/target  (the big model)
   - mini-gpt-tinystories-draft-v1-vol   → /app/draft   (the small model)
 
-Both volumes hold a tokenizer.json. Since modal_train_draft.py was built
-with the target's tokenizer baked in, the two tokenizers are identical
-and speculative decoding is valid.
-
 Usage:
-  modal run modal_sample_speculative.py \\
-      --target-checkpoint checkpoint-6500.json \\
-      --draft-checkpoint  model-final.json \\
-      --prompt "Once upon a time" \\
-      --num-tokens 200 \\
-      --temperature 0.8 \\
-      --k 4
+  modal run modal_benchmark_speculative.py
+  modal run modal_benchmark_speculative.py --num-tokens 400 --k 6 --num-runs 5
 """
 import subprocess
 import shutil
 import modal
 
-app = modal.App("mini-gpt-spec-decode")
+app = modal.App("mini-gpt-spec-decode-bench")
 
 target_vol = modal.Volume.from_name("mini-gpt-tinystories-v4-vol", create_if_missing=False)
 draft_vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v1-vol", create_if_missing=False)
@@ -44,7 +36,7 @@ image = (
         ' && npm install @mni-ml/framework@0.3.3 @mni-ml/framework-linux-x64-gnu-cuda@0.3.3'
     )
     .add_local_file("bpe.js", "/app/bpe.js")
-    .add_local_file("generate_speculative.js", "/app/generate_speculative.js")
+    .add_local_file("benchmark_speculative.js", "/app/benchmark_speculative.js")
 )
 
 
@@ -55,27 +47,26 @@ image = (
     timeout=60 * 60,
     volumes={"/app/target": target_vol, "/app/draft": draft_vol},
 )
-def sample(
+def bench(
     target_checkpoint: str = "checkpoint-6500.json",
     draft_checkpoint: str = "model-final.json",
-    prompt: str = "Once upon a time",
     num_tokens: int = 200,
-    temperature: float = 0.8,
+    temperature: float = 0.0,
     k: int = 4,
+    num_runs: int = 3,
 ):
     # Both models share the target's tokenizer (the draft was trained
     # with that exact tokenizer baked into its image at build time).
     shutil.copyfile("/app/target/tokenizer.json", "/app/tokenizer.json")
-
     cmd = [
         "node",
-        "/app/generate_speculative.js",
+        "/app/benchmark_speculative.js",
         f"/app/target/{target_checkpoint}",
         f"/app/draft/{draft_checkpoint}",
-        prompt,
         str(num_tokens),
         str(temperature),
         str(k),
+        str(num_runs),
         "/app/tokenizer.json",
     ]
     result = subprocess.run(cmd, cwd="/app")
@@ -87,16 +78,16 @@ def sample(
 def main(
     target_checkpoint: str = "checkpoint-6500.json",
     draft_checkpoint: str = "model-final.json",
-    prompt: str = "Once upon a time",
     num_tokens: int = 200,
-    temperature: float = 0.8,
+    temperature: float = 0.0,
     k: int = 4,
+    num_runs: int = 3,
 ):
-    sample.remote(
+    bench.remote(
         target_checkpoint=target_checkpoint,
         draft_checkpoint=draft_checkpoint,
-        prompt=prompt,
         num_tokens=num_tokens,
         temperature=temperature,
         k=k,
+        num_runs=num_runs,
     )
