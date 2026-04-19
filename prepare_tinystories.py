@@ -52,27 +52,38 @@ def main():
 
     print(f"  Total: {len(texts)} stories, {total_chars / 1024 / 1024:.1f} MB")
 
-    # ── Train BPE tokenizer ──────────────────────────────────────────
-    print(f"Training BPE tokenizer (vocab_size={VOCAB_SIZE})...")
-    tokenizer = Tokenizer(BPE(unk_token=None))
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False, use_regex=True)
-    tokenizer.decoder = ByteLevelDecoder()
-
-    trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        special_tokens=["<|endoftext|>"],
-        show_progress=True,
-        min_frequency=2,
-    )
-    tokenizer.train_from_iterator(texts, trainer)
-
-    eot_id = tokenizer.token_to_id("<|endoftext|>")
-    actual_vocab_size = tokenizer.get_vocab_size()
-    print(f"  Vocab size: {actual_vocab_size}, <|endoftext|> ID = {eot_id}")
-
     tok_path = os.path.join(DATA_DIR, "tokenizer.json")
-    tokenizer.save(tok_path)
-    print(f"  Saved tokenizer to {tok_path}")
+
+    # ── Reuse existing tokenizer if present, else train a fresh BPE ──
+    # For speculative decoding, the draft model MUST share the target's
+    # tokenizer. We bake the target's tokenizer.json into the image so
+    # this branch fires when training a draft model.
+    if os.path.exists(tok_path):
+        print(f"Reusing existing tokenizer at {tok_path} (vocab will match exactly)")
+        tokenizer = Tokenizer.from_file(tok_path)
+        eot_id = tokenizer.token_to_id("<|endoftext|>")
+        actual_vocab_size = tokenizer.get_vocab_size()
+        print(f"  Vocab size: {actual_vocab_size}, <|endoftext|> ID = {eot_id}")
+    else:
+        print(f"Training BPE tokenizer (vocab_size={VOCAB_SIZE})...")
+        tokenizer = Tokenizer(BPE(unk_token=None))
+        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False, use_regex=True)
+        tokenizer.decoder = ByteLevelDecoder()
+
+        trainer = BpeTrainer(
+            vocab_size=VOCAB_SIZE,
+            special_tokens=["<|endoftext|>"],
+            show_progress=True,
+            min_frequency=2,
+        )
+        tokenizer.train_from_iterator(texts, trainer)
+
+        eot_id = tokenizer.token_to_id("<|endoftext|>")
+        actual_vocab_size = tokenizer.get_vocab_size()
+        print(f"  Vocab size: {actual_vocab_size}, <|endoftext|> ID = {eot_id}")
+
+        tokenizer.save(tok_path)
+        print(f"  Saved tokenizer to {tok_path}")
 
     # ── Encode all stories ───────────────────────────────────────────
     print("Encoding stories...")

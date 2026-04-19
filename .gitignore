@@ -13,3 +13,4 @@ npm-debug.log*
 framework/
 
 !out/model-final.json
+!out/draft-final.json
