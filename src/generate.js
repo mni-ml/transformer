@@ -15,7 +15,7 @@ import {
   Linear, Embedding,
   softmax, gelu, layerNorm, flashAttention,
 } from '@mni-ml/framework';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BPETokenizer } from './bpe.js';
@@ -150,12 +150,25 @@ class MiniGPT extends Module {
 
 // ── Load + Generate ─────────────────────────────────────────
 
-function loadModel(path, tokenizerOverridePath = null) {
-  const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
+function resolveTokenizerPath(checkpoint, tokenizerOverridePath) {
   const tokPath = tokenizerOverridePath || checkpoint.tokenizerPath;
   if (!tokPath) {
     throw new Error('Checkpoint has no tokenizerPath. Pass data/tokenizer.json as the 5th CLI argument.');
   }
+  if (!existsSync(tokPath)) {
+    throw new Error(`Tokenizer not found: ${tokPath}`);
+  }
+  if (statSync(tokPath).isDirectory()) {
+    throw new Error(
+      `Tokenizer path points to a directory: ${tokPath}. Pass the tokenizer.json file path instead; if your shell wrapped the command, keep /tmp/transformer-weights/tokenizer.json on one line.`
+    );
+  }
+  return tokPath;
+}
+
+function loadModel(path, tokenizerOverridePath = null) {
+  const checkpoint = JSON.parse(readFileSync(path, 'utf-8'));
+  const tokPath = resolveTokenizerPath(checkpoint, tokenizerOverridePath);
   const tokenizer = new BPETokenizer(tokPath);
 
   const model = new MiniGPT(tokenizer.vocabSize, checkpoint.config);
