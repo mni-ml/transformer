@@ -16,8 +16,8 @@ import modal
 
 app = modal.App("mini-gpt-spec-decode-bench")
 
-target_vol = modal.Volume.from_name("mini-gpt-tinystories-v4-vol", create_if_missing=False)
-draft_vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v1-vol", create_if_missing=False)
+target_vol = modal.Volume.from_name("mini-gpt-tinystories-target-vol", create_if_missing=False)
+draft_vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v2-vol", create_if_missing=False)
 
 image = (
     modal.Image.from_registry(
@@ -48,7 +48,7 @@ image = (
     volumes={"/app/target": target_vol, "/app/draft": draft_vol},
 )
 def bench(
-    target_checkpoint: str = "checkpoint-6500.json",
+    target_checkpoint: str = "model-final.json",
     draft_checkpoint: str = "model-final.json",
     num_tokens: int = 200,
     temperature: float = 0.0,
@@ -76,7 +76,7 @@ def bench(
 
 @app.local_entrypoint()
 def main(
-    target_checkpoint: str = "checkpoint-6500.json",
+    target_checkpoint: str = "model-final.json",
     draft_checkpoint: str = "model-final.json",
     num_tokens: int = 200,
     temperature: float = 0.0,

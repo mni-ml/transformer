@@ -11,7 +11,7 @@ and speculative decoding is valid.
 
 Usage:
   modal run modal_sample_speculative.py \\
-      --target-checkpoint checkpoint-6500.json \\
+      --target-checkpoint model-final.json \\
       --draft-checkpoint  model-final.json \\
       --prompt "Once upon a time" \\
       --num-tokens 200 \\
@@ -24,8 +24,8 @@ import modal
 
 app = modal.App("mini-gpt-spec-decode")
 
-target_vol = modal.Volume.from_name("mini-gpt-tinystories-v4-vol", create_if_missing=False)
-draft_vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v1-vol", create_if_missing=False)
+target_vol = modal.Volume.from_name("mini-gpt-tinystories-target-vol", create_if_missing=False)
+draft_vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v2-vol", create_if_missing=False)
 
 image = (
     modal.Image.from_registry(
@@ -56,7 +56,7 @@ image = (
     volumes={"/app/target": target_vol, "/app/draft": draft_vol},
 )
 def sample(
-    target_checkpoint: str = "checkpoint-6500.json",
+    target_checkpoint: str = "model-final.json",
     draft_checkpoint: str = "model-final.json",
     prompt: str = "Once upon a time",
     num_tokens: int = 200,
@@ -85,7 +85,7 @@ def sample(
 
 @app.local_entrypoint()
 def main(
-    target_checkpoint: str = "checkpoint-6500.json",
+    target_checkpoint: str = "model-final.json",
     draft_checkpoint: str = "model-final.json",
     prompt: str = "Once upon a time",
     num_tokens: int = 200,

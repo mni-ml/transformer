@@ -1,16 +1,22 @@
 """
-Train a SMALL draft model for speculative decoding.
+Train a draft model for speculative decoding (v2 — bigger, longer).
 
-The target model lives in mini-gpt-tinystories-v4-vol (6L / 6H / 384d).
-This trains a much smaller draft model that shares the *exact* same
-tokenizer as the target (vocab=4096, EOT id 0). Sharing the vocab is
-the only hard requirement of speculative decoding.
+The target model is a 6L / 6H / 384d MiniGPT (~12.3M params). This
+trains a draft model that shares the *exact* same tokenizer as the
+target (vocab=4096, EOT id 0). Sharing the vocab is the only hard
+requirement of speculative decoding.
 
-Architecture (≈10x smaller than target):
-  nLayer  = 2
-  nHead   = 4
-  nEmbd   = 128       # head_dim = 32
-  blockSize = 256     # same context window as target
+Architecture (≈5.7x smaller than target → ~2.17M params):
+  nLayer  = 3
+  nHead   = 6                # head_dim = 32
+  nEmbd   = 192
+  blockSize = 256            # same context window as target
+
+Why bigger than v1 (which was 1L=2,H=4,E=128, ~960K params):
+  v1 reached val loss 2.61 → only 33% draft acceptance → 0.85x speedup.
+  Sitting in the textbook 5–10x smaller band (vs v1's ~13x) and
+  3x more training steps should push acceptance into the 50–70%
+  range where speculative decoding actually wins.
 
 Image build:
   - bake the local out/tokenizer.json into /app/data so prepare_tinystories.py
@@ -18,18 +24,23 @@ Image build:
   - npm install @mni-ml/framework with CUDA backend
 
 Usage:
-  modal run modal_train_draft.py                # full run
+  modal run modal_train_draft.py                # full run (7500 steps)
   modal run modal_train_draft.py --steps 50     # smoke test
   modal run --detach modal_train_draft.py       # detached
+
+Resume:
+  Re-running without --fresh picks up from the latest checkpoint-NNNN.json
+  found in the volume. To extend training past the original MAX_ITERS,
+  bump MAX_ITERS in this file (or pass --steps NNNN) and re-run.
 """
 import subprocess
 import os
 import signal
 import modal
 
-app = modal.App("mini-gpt-tinystories-draft")
+app = modal.App("mini-gpt-tinystories-draft-v2")
 
-vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v1-vol", create_if_missing=True)
+vol = modal.Volume.from_name("mini-gpt-tinystories-draft-v2-vol", create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -82,17 +93,18 @@ def train(steps: int = 0, fresh: bool = False):
     env = dict(os.environ)
     env["MODEL_DIR"] = "/app/out"
     env["DATA_DIR"] = "/app/data"
-    # ── Draft model architecture (≈10x smaller than target) ──
-    env["N_EMBD"] = "128"
-    env["N_HEAD"] = "4"
-    env["N_LAYER"] = "2"
+    # ── Draft model architecture (≈5.7x smaller than target) ──
+    # 3L / 6H / 192d → 2,174,656 params (vs target 12,322,816)
+    env["N_EMBD"] = "192"
+    env["N_HEAD"] = "6"
+    env["N_LAYER"] = "3"
     env["BLOCK_SIZE"] = "256"
-    # Smaller model → can fit a bigger batch comfortably
+    # Still small enough for a comfortable single-pass batch on A100
     env["BATCH_SIZE"] = "32"
     env["GRAD_ACCUM_STEPS"] = "1"
-    env["CHECKPOINT_EVERY"] = "500"
+    env["CHECKPOINT_EVERY"] = "250"
     env["LR"] = "6e-4"
-    env["MAX_ITERS"] = "5000"
+    env["MAX_ITERS"] = "7500"
     if fresh:
         env["NO_RESUME"] = "1"
     if steps > 0:
@@ -106,4 +118,4 @@ def train(steps: int = 0, fresh: bool = False):
 @app.local_entrypoint()
 def main(steps: int = 0, fresh: bool = False):
     train.remote(steps=steps, fresh=fresh)
-    print("\nDraft model saved to Modal volume 'mini-gpt-tinystories-draft-v1-vol'.")
+    print("\nDraft model saved to Modal volume 'mini-gpt-tinystories-draft-v2-vol'.")
