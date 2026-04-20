@@ -19,6 +19,7 @@ out/*
 !out/.gitkeep
 !out/model-final.json
 !out/draft-final.json
+!out/draft-model-final.json
 !out/tokenizer.json
 
 # Large pretokenized data (from Python prep scripts)
