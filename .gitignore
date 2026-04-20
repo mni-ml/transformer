@@ -14,3 +14,4 @@ framework/
 
 !out/model-final.json
 !out/draft-final.json
+!out/draft-model-final.json
