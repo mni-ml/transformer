@@ -13,6 +13,8 @@ A 12M paramater LLM in **Node.js**, trained with [`@mni-ml/framework`](https://w
 | `src/generate_gpu.js` | **GPU** sampling (`native.flashAttention` required) |
 | `src/generate_kv.js` | **KV-cache** sampling with the local `framework` branch |
 | `src/demo_kv.js` | baseline vs `kv-fp32` vs `kv-int8` benchmark/demo |
+| `src/server.js` | Minimal HTTP inference server (`POST /generate`) |
+| `src/benchmark_http.js` | HTTP load generator (p50/p95 latency, TTFT, throughput) |
 | `src/bpe.js` | HuggingFace-style BPE JSON loader (ByteLevel) |
 | `scripts/prepare_tinystories.py` | Download TinyStories, train BPE, write `data/*.bin` and metadata |
 | `scripts/prepare_youtube.py` | Download YouTube-Commons transcripts, same output layout |
@@ -90,10 +92,42 @@ This repo uses the local `framework/` checkout via `file:./framework`, so `npm i
    With the local KV-cache branch:
 
    ```bash
-   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json fp32
-   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json int8
-   npm run demo:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json
+   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json fp32 fp32
+   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json int8 int8
+   npm run demo:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json int8
    ```
+
+   Arguments after `tokenizer.json` are:
+   - `cacheMode`: `fp32` or `int8` (KV cache precision)
+   - `weightMode`: `fp32` or `int8` (checkpoint weights quantized to int8 then dequantized at load)
+
+## HTTP inference + benchmark
+
+Run the HTTP server:
+
+```bash
+npm run serve -- out/model-final.json data/tokenizer.json 3000 int8
+```
+
+Server endpoints:
+- `GET /health`
+- `GET /stats`
+- `POST /generate` with JSON body:
+
+```json
+{
+  "prompt": "Once upon a time",
+  "maxTokens": 64,
+  "temperature": 0,
+  "cacheMode": "int8"
+}
+```
+
+Run a simple load test:
+
+```bash
+npm run bench:http -- http://localhost:3000 40 8 64 0 int8
+```
 
 ## Train on YouTube-Commons
 
