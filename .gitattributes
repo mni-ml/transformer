@@ -1,3 +1,4 @@
 out/model-final.json filter=lfs diff=lfs merge=lfs -text
 out/draft-final.json filter=lfs diff=lfs merge=lfs -text
 out/draft-model-final.json filter=lfs diff=lfs merge=lfs -text
+out/model-mla-final.json filter=lfs diff=lfs merge=lfs -text
