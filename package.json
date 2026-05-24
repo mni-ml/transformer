@@ -5,15 +5,18 @@
     "node": ">=22.18.0"
   },
   "scripts": {
+    "framework:build": "npm --prefix framework run build:native && npm --prefix framework run build",
     "train": "node src/train.js",
     "train:gpu": "node src/train_gpu.js",
     "generate": "node src/generate.js",
     "generate:gpu": "node src/generate_gpu.js",
+    "generate:kv": "node src/generate_kv.js",
+    "demo:kv": "node src/demo_kv.js",
     "prepare:youtube": "python3 scripts/prepare_youtube.py",
     "prepare:tinystories": "python3 scripts/prepare_tinystories.py",
     "probe:gpu": "node scripts/gpu_probe.js"
   },
   "dependencies": {
-    "@mni-ml/framework": "^0.3.4"
+    "@mni-ml/framework": "file:./framework"
   }
 }

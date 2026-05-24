@@ -11,6 +11,8 @@ A 12M paramater LLM in **Node.js**, trained with [`@mni-ml/framework`](https://w
 | `src/train_gpu.js` | **GPU** training (`createDataset` / `forwardGpu` / `crossEntropyLossGpu`; needs platform CUDA/WebGPU optional package) |
 | `src/generate.js` | **CPU-friendly** sampling (works everywhere) |
 | `src/generate_gpu.js` | **GPU** sampling (`native.flashAttention` required) |
+| `src/generate_kv.js` | **KV-cache** sampling with the local `framework` branch |
+| `src/demo_kv.js` | baseline vs `kv-fp32` vs `kv-int8` benchmark/demo |
 | `src/bpe.js` | HuggingFace-style BPE JSON loader (ByteLevel) |
 | `scripts/prepare_tinystories.py` | Download TinyStories, train BPE, write `data/*.bin` and metadata |
 | `scripts/prepare_youtube.py` | Download YouTube-Commons transcripts, same output layout |
@@ -28,11 +30,22 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements-data.txt
 ```
 
+Build the local `framework` checkout first if you want the KV-cache demo path:
+
+```bash
+git -C framework checkout kv-cache-quantization
+npm --prefix framework install
+npm --prefix framework run build:native
+npm --prefix framework run build
+```
+
 Install JS dependencies:
 
 ```bash
-npm install
+npm install --omit=optional
 ```
+
+This repo uses the local `framework/` checkout via `file:./framework`, so `npm install --omit=optional` keeps the demo on your local branch instead of the published npm package.
 
 ## Train on TinyStories
 
@@ -72,6 +85,14 @@ npm install
 
    ```bash
    node src/generate.js out/model-final.json "<|endoftext|>" 400 0.9 data/tokenizer.json
+   ```
+
+   With the local KV-cache branch:
+
+   ```bash
+   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json fp32
+   npm run generate:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json int8
+   npm run demo:kv -- out/model-final.json "<|endoftext|>" 128 0 data/tokenizer.json
    ```
 
 ## Train on YouTube-Commons
